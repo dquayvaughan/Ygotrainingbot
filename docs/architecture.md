@@ -34,10 +34,10 @@ definition plus a rules/banlist snapshot.
 
 ### Duel simulator
 
-The learning system should depend on a small simulator protocol instead of
-embedding rules logic directly. Yu-Gi-Oh! has too many timing, chain, and
-card-specific interactions for an ad hoc engine. A complete backend can be
-integrated later behind `DuelSimulator`.
+The learning system depends on a small simulator protocol instead of embedding
+rules logic directly. Yu-Gi-Oh! has too many timing, chain, and card-specific
+interactions for an ad hoc engine. The first concrete backend boundary is an
+EDOPro-core-compatible JSON-lines gateway behind `DuelSimulator`.
 
 ### Agents
 
@@ -64,6 +64,6 @@ should reference:
 2. Add a simple deterministic simulator fixture so the learning pipeline can be
    tested before a full duel engine exists.
 3. Integrate current card data ingestion and static set mining.
-4. Connect a rules-complete simulator or replay parser.
+4. Connect a production EDOPro-core-compatible simulator gateway or replay parser.
 5. Add batch experiments for set-by-set exploration and trace analysis.
 6. Persist training traces and benchmark agent versions against fixed baselines.

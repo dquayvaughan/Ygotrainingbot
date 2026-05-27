@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 from typing import Sequence
 
+from ygotrainingbot.agents import FirstLegalActionAgent
 from ygotrainingbot.data import (
     build_card_sets,
     fetch_ygoprodeck_cards,
     load_card_database,
     save_card_database,
 )
+from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 
 
@@ -49,6 +52,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Emit machine-readable JSON instead of a human summary.",
     )
 
+    check_edopro_parser = subcommands.add_parser(
+        "check-edopro",
+        help="Validate paths for a local EDOPro install or data directory.",
+    )
+    check_edopro_parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="EDOPro root directory. Defaults to EDOPRO_HOME or the current directory.",
+    )
+    check_edopro_parser.add_argument(
+        "--bin",
+        type=Path,
+        default=None,
+        help="Optional EDOPro executable path. Defaults to EDOPRO_BIN when set.",
+    )
+
+    edopro_once_parser = subcommands.add_parser(
+        "edopro-play-once",
+        help="Run one duel through a JSON-lines EDOPro headless gateway.",
+    )
+    edopro_once_parser.add_argument(
+        "--gateway-command",
+        required=True,
+        help="Command that starts the EDOPro-core-compatible JSON-lines gateway.",
+    )
+    edopro_once_parser.add_argument("--first-agent", default="bot-a")
+    edopro_once_parser.add_argument("--second-agent", default="bot-b")
+    edopro_once_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -58,6 +91,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_sets=args.max_sets,
             max_candidates_per_set=args.max_candidates_per_set,
             as_json=args.json,
+        )
+    if args.command == "check-edopro":
+        return _check_edopro(args.root, args.bin)
+    if args.command == "edopro-play-once":
+        return _edopro_play_once(
+            args.gateway_command,
+            first_agent=args.first_agent,
+            second_agent=args.second_agent,
+            timeout_seconds=args.timeout_seconds,
         )
     raise ValueError(f"Unknown command {args.command!r}.")
 
@@ -88,6 +130,54 @@ def _train_static(
         print(json.dumps(_report_to_dict(report), indent=2, sort_keys=True))
     else:
         _print_human_report(report)
+    return 0
+
+
+def _check_edopro(root: Path | None, executable: Path | None) -> int:
+    install = (
+        EdoproInstall(root=root, executable=executable).with_defaults()
+        if root is not None
+        else EdoproInstall.from_environment()
+    )
+    errors = install.validation_errors()
+    if errors:
+        print("EDOPro install is not ready:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+
+    print(f"EDOPro install looks ready at {install.root}")
+    return 0
+
+
+def _edopro_play_once(
+    gateway_command: str,
+    *,
+    first_agent: str,
+    second_agent: str,
+    timeout_seconds: float,
+) -> int:
+    config = EdoproGatewayConfig.from_shell_words(
+        shlex.split(gateway_command),
+        timeout_seconds=timeout_seconds,
+    )
+    result = JsonLineEdoproSimulator(config).play(
+        FirstLegalActionAgent(first_agent),
+        FirstLegalActionAgent(second_agent),
+    )
+    print(
+        json.dumps(
+            {
+                "winner": result.winner,
+                "loser": result.loser,
+                "turns": result.turns,
+                "traced_decisions": len(result.traces),
+                "tags": list(result.tags),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

@@ -29,7 +29,8 @@ Static training can tell the bot where to look. To become a chess-bot-like
 opponent, the system still needs these pieces:
 
 1. **Rules-complete simulator adapter**
-   - Implement `DuelSimulator` against an existing Yu-Gi-Oh! engine or replay
+   - Use the EDOPro JSON-lines gateway adapter as the Python boundary.
+   - Implement or deploy a headless gateway around an EDOPro-core-compatible
      runner.
    - Preserve chain links, timing windows, public/private zones, and legal
      actions at every decision point.
