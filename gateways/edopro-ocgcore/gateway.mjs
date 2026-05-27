@@ -27,6 +27,8 @@ const edoproHome = path.resolve(args.edoproHome ?? process.env.EDOPRO_HOME ?? ".
 const maxDecisions = Number(args.maxDecisions ?? 80);
 const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 const stdinIterator = rl[Symbol.asyncIterator]();
+const scriptCache = new Map();
+const scriptLoadStats = { loaded: 0, missing: 0, optional_missing: 0, errors: 0 };
 
 let players = ["bot-a", "bot-b"];
 let database;
@@ -64,7 +66,7 @@ async function runDuel() {
     }
 
     if (status === OcgProcessResult.END) {
-      emitResult({ winner, loser, turns: countTurns(messages), decisions, tags: ["edopro", "ocgcore-wasm"] });
+      emitResult({ winner, loser, turns: countTurns(messages), decisions, tags: ["edopro", "ocgcore-wasm"], script_stats: scriptLoadStats });
       return;
     }
     if (status === OcgProcessResult.CONTINUE) {
@@ -90,6 +92,7 @@ async function runDuel() {
           turns: decisions,
           decisions,
           tags: ["edopro", "ocgcore-wasm", "retry-adjudication", adjudicated.tag],
+          script_stats: scriptLoadStats,
         });
         return;
       }
@@ -142,6 +145,7 @@ async function runDuel() {
         turns: decisions,
         decisions,
         tags: ["edopro", "ocgcore-wasm", "max-decisions", adjudicated.tag],
+        script_stats: scriptLoadStats,
       });
       return;
     }
@@ -372,14 +376,101 @@ async function addDeck(core, duelHandle, team, cards) {
 }
 
 function readScript(scriptName) {
-  const scriptPath = /^c\d+\.lua$/.test(scriptName)
-    ? path.join(edoproHome, "script", "official", scriptName)
-    : path.join(edoproHome, "script", scriptName);
-  if (!existsSync(scriptPath)) {
+  if (scriptCache.has(scriptName)) {
+    return scriptCache.get(scriptName);
+  }
+  const scriptPath = resolveScriptPath(scriptName);
+  if (!scriptPath) {
+    const optional = isOptionalMissingScript(scriptName);
+    if (optional) {
+      scriptLoadStats.optional_missing += 1;
+      emitLog({ event: "script_optional_missing", script: scriptName });
+    } else {
+      scriptLoadStats.missing += 1;
+      emitLog({ event: "script_missing", script: scriptName });
+    }
+    scriptCache.set(scriptName, null);
     return null;
   }
-  return readFileSync(scriptPath, "utf8");
+  try {
+    const content = readFileSync(scriptPath, "utf8");
+    scriptLoadStats.loaded += 1;
+    emitLog({ event: "script_loaded", script: scriptName, path: path.relative(edoproHome, scriptPath) });
+    scriptCache.set(scriptName, content);
+    return content;
+  } catch (error) {
+    scriptLoadStats.errors += 1;
+    emitLog({ event: "script_read_error", script: scriptName, error: String(error) });
+    scriptCache.set(scriptName, null);
+    return null;
+  }
 }
+
+function resolveScriptPath(scriptName) {
+  const candidates = /^c\d+\.lua$/.test(scriptName)
+    ? [
+        path.join(edoproHome, "script", "official", scriptName),
+        path.join(edoproHome, "script", scriptName),
+      ]
+    : [
+        path.join(edoproHome, "script", scriptName),
+        path.join(edoproHome, "script", "official", scriptName),
+      ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function isOptionalMissingScript(scriptName) {
+  if (scriptName === "c0.lua") {
+    return true;
+  }
+  const match = scriptName.match(/^c(\d+)\.lua$/);
+  if (!match || !database) {
+    return false;
+  }
+  const row = database.row(Number(match[1]));
+  return row ? isVanillaMonster(row.type) : false;
+}
+
+function validateDeckScripts(deckA, deckB) {
+  const uniqueCodes = [...new Set([...deckA, ...deckB])];
+  const missingData = [];
+  const missingScripts = [];
+  const scriptlessNormalMonsters = [];
+  for (const code of uniqueCodes) {
+    const row = database.row(code);
+    if (!row) {
+      missingData.push(code);
+      continue;
+    }
+    const scriptName = `c${code}.lua`;
+    if (resolveScriptPath(scriptName)) {
+      continue;
+    }
+    if (isVanillaMonster(row.type)) {
+      scriptlessNormalMonsters.push(code);
+    } else {
+      missingScripts.push(code);
+    }
+  }
+  emitLog({
+    event: "deck_script_validation",
+    total_unique_cards: uniqueCodes.length,
+    missing_data: missingData,
+    missing_scripts: missingScripts,
+    scriptless_normal_monsters: scriptlessNormalMonsters,
+  });
+  if (missingData.length || missingScripts.length) {
+    throw new Error(`Deck script validation failed: missingData=${missingData.join(",")} missingScripts=${missingScripts.join(",")}`);
+  }
+}
+
+function isVanillaMonster(type) {
+  const monster = (type & 0x1) !== 0;
+  const normal = (type & 0x10) !== 0;
+  const effectLikeBits = type & ~0x11;
+  return monster && normal && effectLikeBits === 0;
+}
+
 
 function summarizeMessage(message, lifePoints = [8000, 8000]) {
   return `EDOPro ${ocgMessageTypeStrings.get(message.type) ?? message.type} decision | LP ${playerName(0)}:${lifePoints[0]} ${playerName(1)}:${lifePoints[1]}`;
@@ -500,8 +591,12 @@ class CardDatabase {
     this.names = new Map();
   }
 
+  row(code) {
+    return this.dataStatement.get(code);
+  }
+
   readCard(code) {
-    const row = this.dataStatement.get(code);
+    const row = this.row(code);
     if (!row) {
       return null;
     }
@@ -531,7 +626,7 @@ class CardDatabase {
   }
 
   attack(code) {
-    return this.dataStatement.get(code)?.atk ?? 0;
+    return this.row(code)?.atk ?? 0;
   }
 }
 
@@ -546,6 +641,7 @@ async function main() {
   const deckB = parseDeck(startMessage.deck_b ?? args.deckB, DEFAULT_DECK_B);
 
   database = new CardDatabase(path.join(edoproHome, "cards.cdb"));
+  validateDeckScripts(deckA, deckB);
   lib = await createCore({
     sync: true,
     print: () => {},
