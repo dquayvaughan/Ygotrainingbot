@@ -36,6 +36,8 @@ ygotrain fetch-cards --cache data/cards.json
 ygotrain train-static --cache data/cards.json
 ```
 
+If the console script is not on `PATH`, use `python3 -m ygotrainingbot.cli` with the same subcommands.
+
 `fetch-cards` refreshes the local cache from the current public card database. `train-static` groups those cards by set and mines archetypes, effect signals, and likely interaction candidates that later simulator runs should verify.
 
 ## Current status
