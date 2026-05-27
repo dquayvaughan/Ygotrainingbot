@@ -1,0 +1,63 @@
+name: Train Yu-Gi-Oh Format
+
+on:
+  workflow_dispatch:
+    inputs:
+      format_pack:
+        description: "Path to the format pack JSON"
+        required: true
+        default: "configs/format-packs/goat-2005.json"
+      games_per_matchup:
+        description: "Games to run for each deck matchup"
+        required: true
+        default: "5"
+      max_decisions:
+        description: "Decision cap per game"
+        required: true
+        default: "60"
+
+jobs:
+  train-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "gateways/edopro-ocgcore/package-lock.json"
+
+      - name: Install Python package
+        run: python -m pip install -e ".[dev]"
+
+      - name: Install EDOPro gateway dependencies
+        run: npm ci --prefix gateways/edopro-ocgcore
+
+      - name: Bootstrap EDOPro data
+        run: scripts/bootstrap_edopro_home.sh /tmp/ygotrain/edopro-home
+
+      - name: Train format pack
+        run: |
+          mkdir -p artifacts
+          python -m ygotrainingbot.cli train-format-pack \
+            --pack "${{ inputs.format_pack }}" \
+            --edopro-home /tmp/ygotrain/edopro-home \
+            --games-per-matchup "${{ inputs.games_per_matchup }}" \
+            --max-decisions "${{ inputs.max_decisions }}" \
+            --output artifacts/format-training-report.json
+
+      - name: Upload training report
+        uses: actions/upload-artifact@v4
+        with:
+          name: format-training-report
+          path: artifacts/format-training-report.json
