@@ -16,7 +16,7 @@ The project starts with a deliberately small core:
 - **Coaching outputs**: convert game traces into actionable notes such as
   misplays, alternative lines, and matchup-specific interaction warnings.
 
-See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, and [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner.
+See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner, and [docs/iphone-format-training.md](docs/iphone-format-training.md) for launching format training from an iPhone.
 
 ## Development
 
@@ -70,6 +70,19 @@ python3 -m ygotrainingbot.cli edopro-train \
   --games 25 \
   --output data/edopro-training-report.json
 ```
+
+Train a named format config with:
+
+```bash
+python3 -m ygotrainingbot.cli train-format \
+  --config configs/formats/starter-normal.json \
+  --edopro-home /path/to/edopro-home \
+  --games 25 \
+  --max-decisions 40 \
+  --output data/format-training-report.json
+```
+
+If you only have an iPhone, use the **Train Yu-Gi-Oh Format** GitHub Actions workflow and download the `format-training-report` artifact when the run finishes.
 
 ## Current status
 

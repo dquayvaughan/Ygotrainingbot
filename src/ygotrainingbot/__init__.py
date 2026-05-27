@@ -4,6 +4,7 @@ from ygotrainingbot.agents import DuelAgent, FirstLegalActionAgent
 from ygotrainingbot.coaching import TraceCoach
 from ygotrainingbot.data import build_card_sets, fetch_ygoprodeck_cards, load_card_database
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
+from ygotrainingbot.format_training import FormatTrainingConfig, load_format_training_config
 from ygotrainingbot.models import (
     Card,
     CardSet,
@@ -32,6 +33,7 @@ __all__ = [
     "EdoproGatewayConfig",
     "EdoproInstall",
     "FirstLegalActionAgent",
+    "FormatTrainingConfig",
     "GameAction",
     "JsonLineEdoproSimulator",
     "LearningReport",
@@ -43,6 +45,7 @@ __all__ = [
     "build_card_sets",
     "fetch_ygoprodeck_cards",
     "load_card_database",
+    "load_format_training_config",
     "StaticSetTrainer",
     "StaticTrainingReport",
 ]

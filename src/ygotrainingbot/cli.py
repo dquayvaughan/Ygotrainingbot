@@ -16,6 +16,7 @@ from ygotrainingbot.data import (
     save_card_database,
 )
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
+from ygotrainingbot.format_training import load_format_training_config
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 
 
@@ -102,6 +103,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional JSON file for the gameplay training report.",
     )
 
+    train_format_parser = subcommands.add_parser(
+        "train-format",
+        help="Train a named format from a JSON format config.",
+    )
+    train_format_parser.add_argument("--config", type=Path, required=True)
+    train_format_parser.add_argument(
+        "--edopro-home",
+        type=Path,
+        required=True,
+        help="EDOPro-compatible data home created by scripts/bootstrap_edopro_home.sh.",
+    )
+    train_format_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    train_format_parser.add_argument("--games", type=int, default=None)
+    train_format_parser.add_argument("--max-decisions", type=int, default=None)
+    train_format_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    train_format_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/format-training-report.json"),
+    )
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -127,6 +153,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             games=args.games,
             first_agent=args.first_agent,
             second_agent=args.second_agent,
+            timeout_seconds=args.timeout_seconds,
+            output=args.output,
+        )
+    if args.command == "train-format":
+        return _train_format(
+            args.config,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            games=args.games,
+            max_decisions=args.max_decisions,
             timeout_seconds=args.timeout_seconds,
             output=args.output,
         )
@@ -218,6 +254,7 @@ def _edopro_train(
     second_agent: str,
     timeout_seconds: float,
     output: Path | None,
+    format_name: str | None = None,
 ) -> int:
     if games < 1:
         raise ValueError("games must be at least 1.")
@@ -248,6 +285,7 @@ def _edopro_train(
                 tags[tag] = tags.get(tag, 0) + 1
 
     report = {
+        "format": format_name,
         "games": games,
         "draws": draws,
         "traced_decisions": total_decisions,
@@ -260,6 +298,46 @@ def _edopro_train(
         output.write_text(report_json + "\n", encoding="utf-8")
     print(report_json)
     return 0
+
+
+def _train_format(
+    config_path: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    games: int | None,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    output: Path,
+) -> int:
+    config = load_format_training_config(config_path)
+    run_games = games if games is not None else config.games
+    run_max_decisions = max_decisions if max_decisions is not None else config.max_decisions
+    deck_a = ",".join(str(card_id) for card_id in config.deck_a)
+    deck_b = ",".join(str(card_id) for card_id in config.deck_b)
+    gateway_command = shlex.join(
+        [
+            "node",
+            str(gateway_script),
+            "--edopro-home",
+            str(edopro_home),
+            "--max-decisions",
+            str(run_max_decisions),
+            "--deck-a",
+            deck_a,
+            "--deck-b",
+            deck_b,
+        ]
+    )
+    return _edopro_train(
+        gateway_command,
+        games=run_games,
+        first_agent="bot-a",
+        second_agent="bot-b",
+        timeout_seconds=timeout_seconds,
+        output=output,
+        format_name=config.name,
+    )
 
 
 def _print_human_report(report: StaticTrainingReport) -> None:
