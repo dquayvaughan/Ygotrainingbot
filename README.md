@@ -16,7 +16,7 @@ The project starts with a deliberately small core:
 - **Coaching outputs**: convert game traces into actionable notes such as
   misplays, alternative lines, and matchup-specific interaction warnings.
 
-See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner, and [docs/iphone-format-training.md](docs/iphone-format-training.md) for launching format training from an iPhone, and [docs/format-packs.md](docs/format-packs.md) for banlists and topping deck-list packs.
+See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner, and [docs/iphone-format-training.md](docs/iphone-format-training.md) for launching format training from an iPhone, and [docs/format-packs.md](docs/format-packs.md) for banlists and topping deck-list packs, and [docs/dashboard.md](docs/dashboard.md) for the web dashboard.
 
 ## Development
 
@@ -102,3 +102,28 @@ python3 -m ygotrainingbot.cli train-format-pack \
 ```
 
 Initial packs include Goat 2005 and Edison 2010 representative topping-style deck shells with banlist metadata.
+
+## Web dashboard
+
+Start the mobile-friendly dashboard with:
+
+```bash
+ygotrain-dashboard --host 0.0.0.0 --port 8765
+```
+
+Use the forwarded/public URL from your iPhone to launch jobs, watch logs, and open training reports.
+
+## Agent comparisons
+
+Prove a policy beats the baseline with a win-rate report:
+
+```bash
+python3 -m ygotrainingbot.cli compare-agents \
+  --pack configs/format-packs/proof-normal-baseline.json \
+  --edopro-home /path/to/edopro-home \
+  --candidate-policy heuristic \
+  --baseline-policy first-legal \
+  --games-per-matchup 10 \
+  --max-decisions 200 \
+  --output data/agent-comparison-report.json
+```

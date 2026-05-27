@@ -36,6 +36,8 @@ async function runDuel() {
   let decisions = 0;
   let winner = null;
   let loser = null;
+  let retryQueue = [];
+  const lifePoints = [8000, 8000];
 
   for (let step = 0; step < 10000; step += 1) {
     const status = await lib.duelProcess(handle);
@@ -44,6 +46,12 @@ async function runDuel() {
       if (message.type === OcgMessageType.WIN) {
         winner = playerName(message.player);
         loser = playerName(message.player === 0 ? 1 : 0);
+      } else if (message.type === OcgMessageType.DAMAGE) {
+        lifePoints[message.player] -= message.amount;
+      } else if (message.type === OcgMessageType.RECOVER) {
+        lifePoints[message.player] += message.amount;
+      } else if (message.type === OcgMessageType.LPUPDATE) {
+        lifePoints[message.player] = message.lp;
       }
     }
 
@@ -60,6 +68,21 @@ async function runDuel() {
 
     const selectable = [...messages].reverse().find((message) => legalActionsFor(message).length > 0);
     if (!selectable) {
+      if (messages.some((message) => message.type === OcgMessageType.RETRY)) {
+        if (retryQueue.length > 0) {
+          lib.duelSetResponse(handle, retryQueue.shift().response);
+          continue;
+        }
+        const adjudicated = adjudicateByLifePoints(lifePoints);
+        emitResult({
+          winner: adjudicated.winner,
+          loser: adjudicated.loser,
+          turns: decisions,
+          decisions,
+          tags: ["edopro", "ocgcore-wasm", "retry-adjudication", adjudicated.tag],
+        });
+        return;
+      }
       throw new Error(`ocgcore is waiting, but no supported selectable message was emitted: ${JSON.stringify(safe(messages))}`);
     }
 
@@ -79,19 +102,22 @@ async function runDuel() {
     });
 
     const actionMessage = await readJsonLine();
-    const action = legalActions.find((candidate) => candidate.action_id === actionMessage.action_id);
+    const actionIndex = legalActions.findIndex((candidate) => candidate.action_id === actionMessage.action_id);
+    const action = legalActions[actionIndex];
     if (!action) {
       throw new Error(`Unknown action_id ${actionMessage.action_id} for state ${stateId}.`);
     }
+    retryQueue = legalActions.filter((_candidate, index) => index !== actionIndex);
     lib.duelSetResponse(handle, action.response);
 
     if (decisions >= maxDecisions) {
+      const adjudicated = adjudicateByLifePoints(lifePoints);
       emitResult({
-        winner: null,
-        loser: null,
+        winner: adjudicated.winner,
+        loser: adjudicated.loser,
         turns: decisions,
         decisions,
-        tags: ["edopro", "ocgcore-wasm", "max-decisions"],
+        tags: ["edopro", "ocgcore-wasm", "max-decisions", adjudicated.tag],
       });
       return;
     }
@@ -99,6 +125,17 @@ async function runDuel() {
 
   throw new Error("ocgcore gateway exceeded the hard step limit.");
 }
+
+function adjudicateByLifePoints(lifePoints) {
+  if (lifePoints[0] > lifePoints[1]) {
+    return { winner: playerName(0), loser: playerName(1), tag: "lp-adjudication" };
+  }
+  if (lifePoints[1] > lifePoints[0]) {
+    return { winner: playerName(1), loser: playerName(0), tag: "lp-adjudication" };
+  }
+  return { winner: null, loser: null, tag: "draw" };
+}
+
 
 function legalActionsFor(message) {
   switch (message.type) {

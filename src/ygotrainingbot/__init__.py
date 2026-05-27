@@ -1,6 +1,6 @@
 """Core interfaces for the Yu-Gi-Oh! training bot."""
 
-from ygotrainingbot.agents import DuelAgent, FirstLegalActionAgent
+from ygotrainingbot.agents import DuelAgent, FirstLegalActionAgent, HeuristicActionAgent, create_agent
 from ygotrainingbot.coaching import TraceCoach
 from ygotrainingbot.data import build_card_sets, fetch_ygoprodeck_cards, load_card_database
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
@@ -40,6 +40,7 @@ __all__ = [
     "EdoproGatewayConfig",
     "EdoproInstall",
     "FirstLegalActionAgent",
+    "HeuristicActionAgent",
     "FormatBanlist",
     "FormatDeck",
     "FormatPack",
@@ -53,6 +54,7 @@ __all__ = [
     "TraceCoach",
     "VisibleGameState",
     "build_card_sets",
+    "create_agent",
     "fetch_ygoprodeck_cards",
     "load_card_database",
     "load_format_pack",
