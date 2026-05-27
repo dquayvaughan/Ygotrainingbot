@@ -3,18 +3,18 @@ name: Train Yu-Gi-Oh Format
 on:
   workflow_dispatch:
     inputs:
-      format_config:
-        description: "Path to the format JSON config"
+      format_pack:
+        description: "Path to the format pack JSON"
         required: true
-        default: "configs/formats/starter-normal.json"
-      games:
-        description: "Number of games to run"
+        default: "configs/format-packs/goat-2005.json"
+      games_per_matchup:
+        description: "Games to run for each deck matchup"
         required: true
-        default: "25"
+        default: "5"
       max_decisions:
         description: "Decision cap per game"
         required: true
-        default: "40"
+        default: "60"
 
 jobs:
   train-format:
@@ -46,13 +46,13 @@ jobs:
       - name: Bootstrap EDOPro data
         run: scripts/bootstrap_edopro_home.sh /tmp/ygotrain/edopro-home
 
-      - name: Train format
+      - name: Train format pack
         run: |
           mkdir -p artifacts
-          python -m ygotrainingbot.cli train-format \
-            --config "${{ inputs.format_config }}" \
+          python -m ygotrainingbot.cli train-format-pack \
+            --pack "${{ inputs.format_pack }}" \
             --edopro-home /tmp/ygotrain/edopro-home \
-            --games "${{ inputs.games }}" \
+            --games-per-matchup "${{ inputs.games_per_matchup }}" \
             --max-decisions "${{ inputs.max_decisions }}" \
             --output artifacts/format-training-report.json
 

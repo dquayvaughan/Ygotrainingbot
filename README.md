@@ -16,7 +16,7 @@ The project starts with a deliberately small core:
 - **Coaching outputs**: convert game traces into actionable notes such as
   misplays, alternative lines, and matchup-specific interaction warnings.
 
-See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner, and [docs/iphone-format-training.md](docs/iphone-format-training.md) for launching format training from an iPhone.
+See [docs/architecture.md](docs/architecture.md) for the current system design, [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play, [docs/edopro-integration.md](docs/edopro-integration.md) for connecting an EDOPro-core-compatible headless runner, and [docs/iphone-format-training.md](docs/iphone-format-training.md) for launching format training from an iPhone, and [docs/format-packs.md](docs/format-packs.md) for banlists and topping deck-list packs.
 
 ## Development
 
@@ -87,3 +87,18 @@ If you only have an iPhone, use the **Train Yu-Gi-Oh Format** GitHub Actions wor
 ## Current status
 
 The code in `src/ygotrainingbot` now includes the `DuelSimulator` boundary plus an EDOPro JSON-lines gateway adapter. A production gateway still needs to wrap an EDOPro-core-compatible headless runner and expose legal actions to the bot.
+
+## Format packs
+
+Train all deck matchups in a format pack with:
+
+```bash
+python3 -m ygotrainingbot.cli train-format-pack \
+  --pack configs/format-packs/goat-2005.json \
+  --edopro-home /path/to/edopro-home \
+  --games-per-matchup 5 \
+  --max-decisions 60 \
+  --output data/goat-training-report.json
+```
+
+Initial packs include Goat 2005 and Edison 2010 representative topping-style deck shells with banlist metadata.

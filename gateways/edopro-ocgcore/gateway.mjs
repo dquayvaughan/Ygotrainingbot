@@ -157,6 +157,14 @@ function legalActionsFor(message) {
 
 function idleActions(message) {
   const actions = [];
+  // Put safe phase actions first for baseline agents. More ambitious agents can
+  // still choose summons, sets, and activations from the full legal action list.
+  if (message.to_ep) {
+    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_EP, index: null } });
+  }
+  if (message.to_bp) {
+    actions.push({ action_id: "to-battle-phase", label: "Go to Battle Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_BP, index: null } });
+  }
   message.summons.forEach((card, index) => actions.push({
     action_id: `normal-summon-${index}`,
     label: `Normal Summon ${cardName(card.code)}`,
@@ -187,17 +195,18 @@ function idleActions(message) {
     tags: ["set-spell"],
     response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPELL_SET, index },
   }));
-  if (message.to_bp) {
-    actions.push({ action_id: "to-battle-phase", label: "Go to Battle Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_BP, index: null } });
-  }
-  if (message.to_ep) {
-    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_EP, index: null } });
-  }
   return actions;
 }
 
+
 function battleActions(message) {
   const actions = [];
+  if (message.to_ep) {
+    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_EP, index: null } });
+  }
+  if (message.to_m2) {
+    actions.push({ action_id: "to-main-phase-2", label: "Go to Main Phase 2", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_M2, index: null } });
+  }
   message.attacks.forEach((card, index) => actions.push({
     action_id: `attack-${index}`,
     label: `Attack with ${cardName(card.code)}`,
@@ -210,14 +219,9 @@ function battleActions(message) {
     tags: ["chain"],
     response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_CHAIN, index },
   }));
-  if (message.to_m2) {
-    actions.push({ action_id: "to-main-phase-2", label: "Go to Main Phase 2", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_M2, index: null } });
-  }
-  if (message.to_ep) {
-    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_EP, index: null } });
-  }
   return actions;
 }
+
 
 function fieldPlaceActions(message, responseType) {
   const location = OcgLocation.MZONE;

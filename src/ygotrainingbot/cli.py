@@ -16,7 +16,7 @@ from ygotrainingbot.data import (
     save_card_database,
 )
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
-from ygotrainingbot.format_training import load_format_training_config
+from ygotrainingbot.format_training import FormatDeck, load_format_pack, load_format_training_config
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 
 
@@ -128,6 +128,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("data/format-training-report.json"),
     )
 
+    train_pack_parser = subcommands.add_parser(
+        "train-format-pack",
+        help="Train every matchup in a format pack with banlist metadata and multiple decks.",
+    )
+    train_pack_parser.add_argument("--pack", type=Path, required=True)
+    train_pack_parser.add_argument("--edopro-home", type=Path, required=True)
+    train_pack_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    train_pack_parser.add_argument("--games-per-matchup", type=int, default=None)
+    train_pack_parser.add_argument("--max-decisions", type=int, default=None)
+    train_pack_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    train_pack_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/format-pack-training-report.json"),
+    )
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -162,6 +182,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             edopro_home=args.edopro_home,
             gateway_script=args.gateway_script,
             games=args.games,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            output=args.output,
+        )
+    if args.command == "train-format-pack":
+        return _train_format_pack(
+            args.pack,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            games_per_matchup=args.games_per_matchup,
             max_decisions=args.max_decisions,
             timeout_seconds=args.timeout_seconds,
             output=args.output,
@@ -256,6 +286,31 @@ def _edopro_train(
     output: Path | None,
     format_name: str | None = None,
 ) -> int:
+    report = _collect_edopro_training_report(
+        gateway_command,
+        games=games,
+        first_agent=first_agent,
+        second_agent=second_agent,
+        timeout_seconds=timeout_seconds,
+        format_name=format_name,
+    )
+    report_json = json.dumps(report, indent=2, sort_keys=True)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report_json + "\n", encoding="utf-8")
+    print(report_json)
+    return 0
+
+
+def _collect_edopro_training_report(
+    gateway_command: str,
+    *,
+    games: int,
+    first_agent: str,
+    second_agent: str,
+    timeout_seconds: float,
+    format_name: str | None = None,
+) -> dict[str, object]:
     if games < 1:
         raise ValueError("games must be at least 1.")
 
@@ -284,7 +339,7 @@ def _edopro_train(
             for tag in trace.action.tags:
                 tags[tag] = tags.get(tag, 0) + 1
 
-    report = {
+    return {
         "format": format_name,
         "games": games,
         "draws": draws,
@@ -292,12 +347,6 @@ def _edopro_train(
         "wins_by_agent": wins_by_agent,
         "tags": tags,
     }
-    report_json = json.dumps(report, indent=2, sort_keys=True)
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(report_json + "\n", encoding="utf-8")
-    print(report_json)
-    return 0
 
 
 def _train_format(
@@ -313,8 +362,6 @@ def _train_format(
     config = load_format_training_config(config_path)
     run_games = games if games is not None else config.games
     run_max_decisions = max_decisions if max_decisions is not None else config.max_decisions
-    deck_a = ",".join(str(card_id) for card_id in config.deck_a)
-    deck_b = ",".join(str(card_id) for card_id in config.deck_b)
     gateway_command = shlex.join(
         [
             "node",
@@ -324,9 +371,9 @@ def _train_format(
             "--max-decisions",
             str(run_max_decisions),
             "--deck-a",
-            deck_a,
+            _deck_arg(config.deck_a),
             "--deck-b",
-            deck_b,
+            _deck_arg(config.deck_b),
         ]
     )
     return _edopro_train(
@@ -338,6 +385,111 @@ def _train_format(
         output=output,
         format_name=config.name,
     )
+
+
+def _train_format_pack(
+    pack_path: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    games_per_matchup: int | None,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    output: Path,
+) -> int:
+    pack = load_format_pack(pack_path)
+    run_games = games_per_matchup if games_per_matchup is not None else pack.games
+    run_max_decisions = max_decisions if max_decisions is not None else pack.max_decisions
+    matchups: list[dict[str, object]] = []
+    total_games = 0
+    total_decisions = 0
+    aggregate_tags: dict[str, int] = {}
+
+    for first_deck in pack.decks:
+        for second_deck in pack.decks:
+            report = _collect_edopro_training_report(
+                _gateway_command_for_decks(
+                    gateway_script,
+                    edopro_home=edopro_home,
+                    max_decisions=run_max_decisions,
+                    first_deck=first_deck,
+                    second_deck=second_deck,
+                ),
+                games=run_games,
+                first_agent="bot-a",
+                second_agent="bot-b",
+                timeout_seconds=timeout_seconds,
+                format_name=pack.name,
+            )
+            total_games += int(report["games"])
+            total_decisions += int(report["traced_decisions"])
+            for tag, count in dict(report["tags"]).items():
+                aggregate_tags[str(tag)] = aggregate_tags.get(str(tag), 0) + int(count)
+            matchups.append(
+                {
+                    "deck_a": first_deck.name,
+                    "deck_b": second_deck.name,
+                    "report": report,
+                }
+            )
+
+    pack_report = {
+        "format": pack.name,
+        "description": pack.description,
+        "banlist": {
+            "forbidden": list(pack.banlist.forbidden),
+            "limited": list(pack.banlist.limited),
+            "semi_limited": list(pack.banlist.semi_limited),
+        },
+        "decks": [
+            {
+                "name": deck.name,
+                "archetype": deck.archetype,
+                "source": deck.source,
+                "main_count": len(deck.main),
+            }
+            for deck in pack.decks
+        ],
+        "games_per_matchup": run_games,
+        "max_decisions": run_max_decisions,
+        "total_games": total_games,
+        "total_traced_decisions": total_decisions,
+        "aggregate_tags": aggregate_tags,
+        "matchups": matchups,
+    }
+    report_json = json.dumps(pack_report, indent=2, sort_keys=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report_json + "\n", encoding="utf-8")
+    print(report_json)
+    return 0
+
+
+def _gateway_command_for_decks(
+    gateway_script: Path,
+    *,
+    edopro_home: Path,
+    max_decisions: int,
+    first_deck: FormatDeck,
+    second_deck: FormatDeck,
+) -> str:
+    return shlex.join(
+        [
+            "node",
+            str(gateway_script),
+            "--edopro-home",
+            str(edopro_home),
+            "--max-decisions",
+            str(max_decisions),
+            "--deck-a",
+            _deck_arg(first_deck.main),
+            "--deck-b",
+            _deck_arg(second_deck.main),
+        ]
+    )
+
+
+def _deck_arg(cards: tuple[int, ...]) -> str:
+    return ",".join(str(card_id) for card_id in cards)
 
 
 def _print_human_report(report: StaticTrainingReport) -> None:
