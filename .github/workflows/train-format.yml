@@ -15,6 +15,10 @@ on:
         description: "Decision cap per game"
         required: true
         default: "60"
+      learned_policy:
+        description: "Optional repo path to learned-policy.json for both agents"
+        required: false
+        default: ""
 
 jobs:
   train-format:
@@ -49,12 +53,17 @@ jobs:
       - name: Train format pack
         run: |
           mkdir -p artifacts
+          EXTRA_ARGS=""
+          if [ -n "${{ inputs.learned_policy }}" ]; then
+            EXTRA_ARGS="--agent-a-weights ${{ inputs.learned_policy }} --agent-b-weights ${{ inputs.learned_policy }}"
+          fi
           python -m ygotrainingbot.cli train-format-pack \
             --pack "${{ inputs.format_pack }}" \
             --edopro-home /tmp/ygotrain/edopro-home \
             --games-per-matchup "${{ inputs.games_per_matchup }}" \
             --max-decisions "${{ inputs.max_decisions }}" \
-            --output artifacts/format-training-report.json
+            --output artifacts/format-training-report.json \
+            $EXTRA_ARGS
           python -m ygotrainingbot.cli learn-from-report \
             --report artifacts/format-training-report.json \
             --policy artifacts/learned-policy.json \

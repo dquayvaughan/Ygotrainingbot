@@ -84,3 +84,19 @@ def test_control_agent_prefers_removal_chain_over_decline() -> None:
     )
 
     assert create_agent("control").choose_action(state) == removal
+
+
+def test_learned_weights_affect_heuristic_scoring() -> None:
+    phase = GameAction("to-end-phase", "Go to End Phase", tags=("phase",))
+    summon = GameAction("normal-summon-0", "Normal Summon", tags=("normal-summon",))
+    state = VisibleGameState(
+        state_id="learned",
+        turn=1,
+        active_player="bot-a",
+        summary="Learned weights",
+        legal_actions=(phase, summon),
+    )
+
+    agent = create_agent("heuristic", learned_weights={"phase": 300.0})
+
+    assert agent.choose_action(state) == phase

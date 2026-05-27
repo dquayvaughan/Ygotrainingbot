@@ -48,6 +48,7 @@ class TrainingJob:
     report_path: str
     summary_path: str
     policy_path: str
+    using_learned_policy: str | None
     error: str | None = None
 
 
@@ -111,6 +112,9 @@ class DashboardState:
             report_path=self._display_path(job_dir / "report.json"),
             summary_path=self._display_path(job_dir / "learning-summary.txt"),
             policy_path=self._display_path(job_dir / "learned-policy.json"),
+            using_learned_policy=self._display_path(self._global_policy_path())
+            if self._global_policy_path().exists()
+            else None,
         )
         self._write_job(job)
         thread = threading.Thread(target=self._run_job, args=(job,), daemon=True)
@@ -165,6 +169,13 @@ class DashboardState:
                     "--output",
                     str(report_path),
                 ]
+                if job.using_learned_policy:
+                    command.extend([
+                        "--agent-a-weights",
+                        str(self._global_policy_path()),
+                        "--agent-b-weights",
+                        str(self._global_policy_path()),
+                    ])
                 log.write("$ " + " ".join(command) + "\n")
                 log.flush()
                 process = subprocess.run(
@@ -182,7 +193,12 @@ class DashboardState:
                         job_dir / "learned-policy.json",
                     )
                     (job_dir / "learning-summary.txt").write_text(english, encoding="utf-8")
+                    self._global_policy_path().write_text(
+                        (job_dir / "learned-policy.json").read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
                     log.write("\n$ generated learning-summary.txt and learned-policy.json\n")
+                    log.write("$ updated .ygotrain/learned-policy.json for the next run\n")
                     job.status = "completed"
                 else:
                     job.status = "failed"
@@ -239,6 +255,9 @@ class DashboardState:
         if "/" in job_id or "\\" in job_id or ".." in job_id:
             raise ValueError("invalid job id.")
         return self.settings.jobs_dir / job_id
+
+    def _global_policy_path(self) -> Path:
+        return self.settings.jobs_dir.parent / "learned-policy.json"
 
     def _display_path(self, path: Path) -> str:
         try:
