@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,6 +152,8 @@ class JsonLineEdoproSimulator:
             encoding="utf-8",
         )
         traces: list[DuelTrace] = []
+        gateway_logs: list[object] = []
+        line_queue = _start_stdout_reader(process)
 
         try:
             self._send(
@@ -165,7 +168,7 @@ class JsonLineEdoproSimulator:
 
             while True:
                 self._ensure_time_remaining(started_at)
-                line = self._readline(process, started_at)
+                line = self._readline(process, line_queue, started_at)
                 message = _decode_message(line)
                 message_type = message.get("type")
 
@@ -206,9 +209,10 @@ class JsonLineEdoproSimulator:
                     continue
 
                 if message_type == "result":
-                    return _result_from_payload(message, traces)
+                    return _result_from_payload(message, traces, gateway_logs)
 
                 if message_type == "log":
+                    gateway_logs.append(message.get("message", ""))
                     continue
 
                 raise EdoproGatewayError(f"Unknown gateway message type: {message_type!r}")
@@ -221,17 +225,21 @@ class JsonLineEdoproSimulator:
                 f"EDOPro gateway exceeded {self._config.timeout_seconds:.1f}s timeout."
             )
 
-    def _readline(self, process: subprocess.Popen[str], started_at: float) -> str:
-        if process.stdout is None:
-            raise EdoproGatewayError("Gateway stdout pipe was not available.")
+    def _readline(
+        self,
+        process: subprocess.Popen[str],
+        line_queue: "queue.Queue[str | None]",
+        started_at: float,
+    ) -> str:
         remaining = self._config.timeout_seconds - (time.monotonic() - started_at)
         if remaining <= 0:
             self._ensure_time_remaining(started_at)
-        readable, _, _ = select.select([process.stdout], [], [], remaining)
-        if not readable:
+        try:
+            line = line_queue.get(timeout=remaining)
+        except queue.Empty as exc:
             self._ensure_time_remaining(started_at)
-            raise EdoproGatewayTimeout("EDOPro gateway did not emit data before timeout.")
-        line = process.stdout.readline()
+            raise EdoproGatewayTimeout("EDOPro gateway did not emit data before timeout.") from exc
+
         if line:
             return line
 
@@ -245,6 +253,22 @@ class JsonLineEdoproSimulator:
             raise EdoproGatewayError("Gateway stdin pipe was not available.")
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
+
+
+def _start_stdout_reader(process: subprocess.Popen[str]) -> "queue.Queue[str | None]":
+    if process.stdout is None:
+        raise EdoproGatewayError("Gateway stdout pipe was not available.")
+    line_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in process.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    threading.Thread(target=read_lines, daemon=True).start()
+    return line_queue
 
 
 def _decode_message(line: str) -> dict[str, Any]:
@@ -294,7 +318,11 @@ def _string_sequence_mapping(payload: Any) -> dict[str, tuple[str, ...]]:
     }
 
 
-def _result_from_payload(payload: dict[str, Any], traces: list[DuelTrace]) -> MatchResult:
+def _result_from_payload(
+    payload: dict[str, Any],
+    traces: list[DuelTrace],
+    gateway_logs: list[object],
+) -> MatchResult:
     winner = payload.get("winner")
     loser = payload.get("loser")
     return MatchResult(
@@ -303,6 +331,7 @@ def _result_from_payload(payload: dict[str, Any], traces: list[DuelTrace]) -> Ma
         turns=int(payload.get("turns", 0)),
         traces=tuple(traces),
         tags=tuple(str(tag) for tag in payload.get("tags", ("edopro",))),
+        metadata={"gateway_logs": tuple(gateway_logs)},
     )
 
 

@@ -98,6 +98,7 @@ class MatchResult:
     turns: int
     traces: tuple[DuelTrace, ...]
     tags: tuple[str, ...] = ()
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def is_draw(self) -> bool:

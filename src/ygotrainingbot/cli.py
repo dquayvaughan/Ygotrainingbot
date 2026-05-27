@@ -404,6 +404,7 @@ def _collect_edopro_training_report(
     tags: dict[str, int] = {}
     action_counts: dict[str, int] = {}
     decision_samples: list[dict[str, object]] = []
+    engine_log_samples: list[object] = []
     total_decisions = 0
     draws = 0
 
@@ -417,6 +418,9 @@ def _collect_edopro_training_report(
             create_agent(agent_b_policy, second_agent),
         )
         total_decisions += len(result.traces)
+        for log_entry in result.metadata.get("gateway_logs", ()):
+            if len(engine_log_samples) < 160:
+                engine_log_samples.append(log_entry)
         for trace in result.traces:
             action_counts[trace.action.action_id] = action_counts.get(trace.action.action_id, 0) + 1
             if len(decision_samples) < 25:
@@ -456,6 +460,7 @@ def _collect_edopro_training_report(
         "tags": tags,
         "action_counts": action_counts,
         "decision_samples": decision_samples,
+        "engine_log_samples": engine_log_samples,
     }
 
 

@@ -9,6 +9,7 @@ import createCore, {
   SelectBattleCMDAction,
   SelectIdleCMDAction,
   ocgMessageTypeStrings,
+  ocgProcessResultString,
   ocgPositionParse,
   ocgPositionString,
 } from "ocgcore-wasm";
@@ -42,6 +43,13 @@ async function runDuel() {
   for (let step = 0; step < 10000; step += 1) {
     const status = await lib.duelProcess(handle);
     const messages = lib.duelGetMessage(handle);
+    emitLog({
+      event: "engine_messages",
+      step,
+      status: ocgProcessResultString.get(status) ?? status,
+      life_points: [...lifePoints],
+      messages: safe(messages),
+    });
     for (const message of messages) {
       if (message.type === OcgMessageType.WIN) {
         winner = playerName(message.player);
@@ -70,7 +78,9 @@ async function runDuel() {
     if (!selectable) {
       if (messages.some((message) => message.type === OcgMessageType.RETRY)) {
         if (retryQueue.length > 0) {
-          lib.duelSetResponse(handle, retryQueue.shift().response);
+          const retryAction = retryQueue.shift();
+          emitLog({ event: "retry_response", action: safe(retryAction) });
+          lib.duelSetResponse(handle, retryAction.response);
           continue;
         }
         const adjudicated = adjudicateByLifePoints(lifePoints);
@@ -89,6 +99,13 @@ async function runDuel() {
     decisions += 1;
     const legalActions = legalActionsFor(selectable, lifePoints);
     const stateId = `ocgcore-${decisions}`;
+    emitLog({
+      event: "decision_state",
+      state_id: stateId,
+      selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
+      player: selectable.player,
+      legal_action_ids: legalActions.map((action) => action.action_id),
+    });
     emit({
       type: "state",
       state: {
@@ -108,6 +125,13 @@ async function runDuel() {
       throw new Error(`Unknown action_id ${actionMessage.action_id} for state ${stateId}.`);
     }
     retryQueue = legalActions.filter((_candidate, index) => index !== actionIndex);
+    emitLog({
+      event: "submit_response",
+      state_id: stateId,
+      requested_action: safe(actionMessage),
+      selected_action: safe({ ...action, response: undefined }),
+      response: safe(action.response),
+    });
     lib.duelSetResponse(handle, action.response);
 
     if (decisions >= maxDecisions) {
@@ -276,20 +300,48 @@ function battleActions(message, lifePoints) {
 
 
 function fieldPlaceActions(message, responseType) {
-  const location = OcgLocation.MZONE;
-  const places = [];
-  for (let sequence = 0; sequence < 5; sequence += 1) {
-    places.push({
-      action_id: `place-mzone-${sequence}`,
-      label: `Choose monster zone ${sequence + 1}`,
-      tags: ["zone"],
+  const places = decodeFieldMask(message.field_mask, message.count, message.player);
+  return places.map((place) => {
+    const locationName = place.location === OcgLocation.SZONE ? "spell/trap zone" : "monster zone";
+    return {
+      action_id: `place-${locationName.replaceAll("/", "-").replaceAll(" ", "-")}-${place.player}-${place.sequence}`,
+      label: `Choose ${playerName(place.player)} ${locationName} ${place.sequence + 1}`,
+      tags: ["zone", place.location === OcgLocation.SZONE ? "szone" : "mzone"],
       response: {
         type: responseType,
-        places: [{ player: message.player, location, sequence }],
+        places: [place],
       },
-    });
+    };
+  });
+}
+
+function decodeFieldMask(fieldMask, count, activePlayer) {
+  const places = [];
+  const unsignedMask = fieldMask >>> 0;
+  const opponent = activePlayer === 0 ? 1 : 0;
+  // ocgcore field masks are relative to the selecting player: low MZONE/SZONE
+  // bits are the active player's zones, high MZONE/SZONE bits are opponent zones.
+  const ranges = [
+    { player: activePlayer, location: OcgLocation.MZONE, offset: 0, length: 7 },
+    { player: activePlayer, location: OcgLocation.SZONE, offset: 8, length: 8 },
+    { player: opponent, location: OcgLocation.MZONE, offset: 16, length: 7 },
+    { player: opponent, location: OcgLocation.SZONE, offset: 24, length: 8 },
+  ];
+
+  for (const range of ranges) {
+    for (let sequence = 0; sequence < range.length; sequence += 1) {
+      const bit = range.offset + sequence;
+      const isUnavailable = ((unsignedMask >>> bit) & 1) === 1;
+      if (!isUnavailable) {
+        places.push({ player: range.player, location: range.location, sequence });
+      }
+    }
   }
-  return places;
+
+  if (places.length === 0) {
+    emitLog({ event: "field_mask_decode_empty", field_mask: unsignedMask, count, activePlayer });
+  }
+  return places.slice(0, Math.max(1, count || 1));
 }
 
 
@@ -354,30 +406,21 @@ function visibleZonesFor(activePlayer, lifePoints) {
       "legal_actions:actionable own/public choices only",
       "opponent_card_identities:not_exposed",
     ],
-    hidden_counts: [
-      `${playerName(activePlayer)}.hand:${queryCount(activePlayer, OcgLocation.HAND)}`,
-      `${playerName(opponent)}.hand:${queryCount(opponent, OcgLocation.HAND)}`,
-      `${playerName(activePlayer)}.deck:${queryCount(activePlayer, OcgLocation.DECK)}`,
-      `${playerName(opponent)}.deck:${queryCount(opponent, OcgLocation.DECK)}`,
-      `${playerName(activePlayer)}.extra:${queryCount(activePlayer, OcgLocation.EXTRA)}`,
-      `${playerName(opponent)}.extra:${queryCount(opponent, OcgLocation.EXTRA)}`,
+    hidden_zones: [
+      `${playerName(activePlayer)}.hand:own_cards_known_to_engine_actions`,
+      `${playerName(opponent)}.hand:hidden`,
+      `${playerName(activePlayer)}.deck:hidden_order`,
+      `${playerName(opponent)}.deck:hidden_order`,
+      `${playerName(activePlayer)}.extra:hidden_until_public`,
+      `${playerName(opponent)}.extra:hidden_until_public`,
     ],
-    public_counts: [
-      `${playerName(activePlayer)}.grave:${queryCount(activePlayer, OcgLocation.GRAVE)}`,
-      `${playerName(opponent)}.grave:${queryCount(opponent, OcgLocation.GRAVE)}`,
-      `${playerName(activePlayer)}.banished:${queryCount(activePlayer, OcgLocation.REMOVED)}`,
-      `${playerName(opponent)}.banished:${queryCount(opponent, OcgLocation.REMOVED)}`,
+    public_zones: [
+      "graveyards:public_when_reported_by_legal_actions",
+      "banished:public_when_reported_by_legal_actions",
     ],
   };
 }
 
-function queryCount(player, location) {
-  try {
-    return lib.duelQueryCount(handle, player, location);
-  } catch (_error) {
-    return 0;
-  }
-}
 
 function countTurns(messages) {
   const turns = messages.filter((message) => message.type === OcgMessageType.NEW_TURN).length;
@@ -425,7 +468,7 @@ function emit(message) {
 }
 
 function emitLog(line) {
-  emit({ type: "log", message: String(line) });
+  emit({ type: "log", message: typeof line === "string" ? line : safe(line) });
 }
 
 function emitResult(result) {
