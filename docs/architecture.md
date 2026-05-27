@@ -63,6 +63,7 @@ should reference:
    results, and coaching recommendations.
 2. Add a simple deterministic simulator fixture so the learning pipeline can be
    tested before a full duel engine exists.
-3. Integrate real set/card data ingestion.
+3. Integrate current card data ingestion and static set mining.
 4. Connect a rules-complete simulator or replay parser.
 5. Add batch experiments for set-by-set exploration and trace analysis.
+6. Persist training traces and benchmark agent versions against fixed baselines.

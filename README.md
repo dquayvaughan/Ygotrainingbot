@@ -16,7 +16,7 @@ The project starts with a deliberately small core:
 - **Coaching outputs**: convert game traces into actionable notes such as
   misplays, alternative lines, and matchup-specific interaction warnings.
 
-See [docs/architecture.md](docs/architecture.md) for the current system design.
+See [docs/architecture.md](docs/architecture.md) for the current system design and [docs/training-roadmap.md](docs/training-roadmap.md) for the path from immediate static training to full self-play.
 
 ## Development
 
@@ -28,6 +28,15 @@ source .venv/bin/activate
 python -m pip install -e ".[dev]"
 pytest
 ```
+
+Start the current-card static training loop with:
+
+```bash
+ygotrain fetch-cards --cache data/cards.json
+ygotrain train-static --cache data/cards.json
+```
+
+`fetch-cards` refreshes the local cache from the current public card database. `train-static` groups those cards by set and mines archetypes, effect signals, and likely interaction candidates that later simulator runs should verify.
 
 ## Current status
 

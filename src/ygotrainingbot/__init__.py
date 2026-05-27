@@ -2,6 +2,7 @@
 
 from ygotrainingbot.agents import DuelAgent, FirstLegalActionAgent
 from ygotrainingbot.coaching import TraceCoach
+from ygotrainingbot.data import build_card_sets, fetch_ygoprodeck_cards, load_card_database
 from ygotrainingbot.models import (
     Card,
     CardSet,
@@ -14,6 +15,7 @@ from ygotrainingbot.models import (
     VisibleGameState,
 )
 from ygotrainingbot.simulation import DeterministicScenarioSimulator, DuelSimulator
+from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 from ygotrainingbot.training import LearningReport, SetExplorationPlan, SelfPlayRunner
 
 __all__ = [
@@ -34,4 +36,9 @@ __all__ = [
     "SetExplorationPlan",
     "TraceCoach",
     "VisibleGameState",
+    "build_card_sets",
+    "fetch_ygoprodeck_cards",
+    "load_card_database",
+    "StaticSetTrainer",
+    "StaticTrainingReport",
 ]
