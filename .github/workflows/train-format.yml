@@ -55,9 +55,16 @@ jobs:
             --games-per-matchup "${{ inputs.games_per_matchup }}" \
             --max-decisions "${{ inputs.max_decisions }}" \
             --output artifacts/format-training-report.json
+          python -m ygotrainingbot.cli learn-from-report \
+            --report artifacts/format-training-report.json \
+            --policy artifacts/learned-policy.json \
+            --summary artifacts/learning-summary.txt
 
       - name: Upload training report
         uses: actions/upload-artifact@v4
         with:
           name: format-training-report
-          path: artifacts/format-training-report.json
+          path: |
+            artifacts/format-training-report.json
+            artifacts/learning-summary.txt
+            artifacts/learned-policy.json

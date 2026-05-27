@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ygotrainingbot.format_training import load_format_pack
+from ygotrainingbot.learning import learn_from_report
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,8 @@ class TrainingJob:
     returncode: int | None
     log_path: str
     report_path: str
+    summary_path: str
+    policy_path: str
     error: str | None = None
 
 
@@ -106,6 +109,8 @@ class DashboardState:
             returncode=None,
             log_path=self._display_path(job_dir / "training.log"),
             report_path=self._display_path(job_dir / "report.json"),
+            summary_path=self._display_path(job_dir / "learning-summary.txt"),
+            policy_path=self._display_path(job_dir / "learned-policy.json"),
         )
         self._write_job(job)
         thread = threading.Thread(target=self._run_job, args=(job,), daemon=True)
@@ -123,6 +128,12 @@ class DashboardState:
         if not report_path.exists():
             raise KeyError(job_id)
         return json.loads(report_path.read_text(encoding="utf-8"))
+
+    def summary_text(self, job_id: str) -> str:
+        summary_path = self._job_dir(job_id) / "learning-summary.txt"
+        if not summary_path.exists():
+            return "Learning summary is not ready yet."
+        return summary_path.read_text(encoding="utf-8", errors="replace")
 
     def _run_job(self, job: TrainingJob) -> None:
         job_dir = self._job_dir(job.job_id)
@@ -165,7 +176,16 @@ class DashboardState:
                     check=False,
                 )
                 job.returncode = process.returncode
-                job.status = "completed" if process.returncode == 0 else "failed"
+                if process.returncode == 0:
+                    _analysis, english = learn_from_report(
+                        report_path,
+                        job_dir / "learned-policy.json",
+                    )
+                    (job_dir / "learning-summary.txt").write_text(english, encoding="utf-8")
+                    log.write("\n$ generated learning-summary.txt and learned-policy.json\n")
+                    job.status = "completed"
+                else:
+                    job.status = "failed"
         except Exception as exc:  # pragma: no cover - defensive job boundary
             job.status = "failed"
             job.error = str(exc)
@@ -271,6 +291,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/jobs/") and path.endswith("/report"):
             job_id = path.split("/")[3]
             self._send_json(self.state.report(job_id))
+        elif path.startswith("/api/jobs/") and path.endswith("/summary"):
+            job_id = path.split("/")[3]
+            self._send_text(self.state.summary_text(job_id))
         elif path.startswith("/api/jobs/"):
             job_id = path.split("/")[3]
             self._send_json({"job": self.state.job(job_id)})
@@ -474,7 +497,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     async function loadJobs() {
       const data = await json('/api/jobs');
       jobsEl.innerHTML = data.jobs.map(j => {
-        const report = j.status === 'completed' ? `<a href="/api/jobs/${j.job_id}/report" target="_blank">Report</a>` : '';
+        const report = j.status === 'completed' ? `<a href="/api/jobs/${j.job_id}/report" target="_blank">Report</a> · <a href="/api/jobs/${j.job_id}/summary" target="_blank">What I learned</a>` : '';
         return `<div class="job" data-job="${j.job_id}">
           <strong>${j.pack}</strong><br/>
           <span class="status ${j.status}">${j.status}</span>

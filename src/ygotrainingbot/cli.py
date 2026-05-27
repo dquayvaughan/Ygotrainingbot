@@ -17,6 +17,7 @@ from ygotrainingbot.data import (
 )
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
 from ygotrainingbot.format_training import FormatDeck, load_format_pack, load_format_training_config
+from ygotrainingbot.learning import learn_from_report
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 
 
@@ -200,6 +201,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("data/agent-benchmark-report.json"),
     )
 
+    learn_parser = subcommands.add_parser(
+        "learn-from-report",
+        help="Update simple policy weights and write a plain-English learning report.",
+    )
+    learn_parser.add_argument("--report", type=Path, required=True)
+    learn_parser.add_argument(
+        "--policy",
+        type=Path,
+        default=Path("data/learned-policy.json"),
+        help="JSON policy-weight file to update.",
+    )
+    learn_parser.add_argument(
+        "--summary",
+        type=Path,
+        default=Path("data/learning-summary.txt"),
+        help="Plain-English summary output path.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -276,7 +295,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             output=args.output,
         )
+    if args.command == "learn-from-report":
+        return _learn_from_report(args.report, policy=args.policy, summary=args.summary)
     raise ValueError(f"Unknown command {args.command!r}.")
+
+
+def _learn_from_report(report: Path, *, policy: Path, summary: Path) -> int:
+    _analysis, english = learn_from_report(report, policy)
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text(english, encoding="utf-8")
+    print(english)
+    return 0
 
 
 def _fetch_cards(cache_path: Path) -> int:

@@ -144,3 +144,16 @@ python3 -m ygotrainingbot.cli benchmark-agents \
 ```
 
 Decision samples include the selected action, heuristic score/explanation, top alternatives, public LP, and hidden-zone counts. Opponent card identities are not exposed to the policy.
+
+## Learning from reports
+
+After a training run, generate a plain-English learning report and update simple policy weights:
+
+```bash
+python3 -m ygotrainingbot.cli learn-from-report \
+  --report data/format-training-report.json \
+  --policy data/learned-policy.json \
+  --summary data/learning-summary.txt
+```
+
+The summary explains performance, likely mistakes, best plays, and what tag weights the bot adjusted for the next run. GitHub Actions and dashboard jobs generate this automatically.
