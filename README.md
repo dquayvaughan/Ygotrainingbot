@@ -144,3 +144,45 @@ python3 -m ygotrainingbot.cli benchmark-agents \
 ```
 
 Decision samples include the selected action, heuristic score/explanation, top alternatives, public LP, and hidden-zone counts. Opponent card identities are not exposed to the policy.
+
+## Learning from reports
+
+After a training run, generate a plain-English learning report and update simple policy weights:
+
+```bash
+python3 -m ygotrainingbot.cli learn-from-report \
+  --report data/format-training-report.json \
+  --policy data/learned-policy.json \
+  --summary data/learning-summary.txt
+```
+
+The summary explains performance, likely mistakes, best plays, and what tag weights the bot adjusted for the next run. GitHub Actions and dashboard jobs generate this automatically.
+
+### Use and promote learned weights
+
+Run future games with a learned policy file:
+
+```bash
+python3 -m ygotrainingbot.cli train-format-pack \
+  --pack configs/format-packs/goat-2005.json \
+  --edopro-home /path/to/edopro-home \
+  --agent-a-policy heuristic \
+  --agent-b-policy heuristic \
+  --agent-a-weights data/learned-policy.json \
+  --agent-b-weights data/learned-policy.json \
+  --output data/weighted-training-report.json
+```
+
+Compare before/after and only promote if the learned weights win:
+
+```bash
+python3 -m ygotrainingbot.cli promote-learned-policy \
+  --pack configs/format-packs/goat-2005.json \
+  --edopro-home /path/to/edopro-home \
+  --policy heuristic \
+  --learned-policy data/learned-policy.json \
+  --promote-to data/promoted-policy.json \
+  --output data/promotion-report.json
+```
+
+Dashboard jobs automatically use `.ygotrain/learned-policy.json` when present and update it after each completed run.

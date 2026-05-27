@@ -17,6 +17,7 @@ from ygotrainingbot.data import (
 )
 from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
 from ygotrainingbot.format_training import FormatDeck, load_format_pack, load_format_training_config
+from ygotrainingbot.learning import learn_from_report
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
 
 
@@ -97,6 +98,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     edopro_train_parser.add_argument("--second-agent", default="bot-b")
     edopro_train_parser.add_argument("--agent-a-policy", default="first-legal")
     edopro_train_parser.add_argument("--agent-b-policy", default="first-legal")
+    edopro_train_parser.add_argument("--agent-a-weights", type=Path, default=None)
+    edopro_train_parser.add_argument("--agent-b-weights", type=Path, default=None)
     edopro_train_parser.add_argument("--timeout-seconds", type=float, default=30.0)
     edopro_train_parser.add_argument(
         "--output",
@@ -146,6 +149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_pack_parser.add_argument("--timeout-seconds", type=float, default=30.0)
     train_pack_parser.add_argument("--agent-a-policy", default="heuristic")
     train_pack_parser.add_argument("--agent-b-policy", default="heuristic")
+    train_pack_parser.add_argument("--agent-a-weights", type=Path, default=None)
+    train_pack_parser.add_argument("--agent-b-weights", type=Path, default=None)
     train_pack_parser.add_argument(
         "--output",
         type=Path,
@@ -165,6 +170,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     compare_parser.add_argument("--candidate-policy", default="heuristic")
     compare_parser.add_argument("--baseline-policy", default="first-legal")
+    compare_parser.add_argument("--candidate-weights", type=Path, default=None)
+    compare_parser.add_argument("--baseline-weights", type=Path, default=None)
     compare_parser.add_argument("--games-per-matchup", type=int, default=5)
     compare_parser.add_argument("--max-decisions", type=int, default=None)
     compare_parser.add_argument("--timeout-seconds", type=float, default=30.0)
@@ -200,6 +207,68 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("data/agent-benchmark-report.json"),
     )
 
+    learn_parser = subcommands.add_parser(
+        "learn-from-report",
+        help="Update simple policy weights and write a plain-English learning report.",
+    )
+    learn_parser.add_argument("--report", type=Path, required=True)
+    learn_parser.add_argument(
+        "--policy",
+        type=Path,
+        default=Path("data/learned-policy.json"),
+        help="JSON policy-weight file to update.",
+    )
+    learn_parser.add_argument(
+        "--summary",
+        type=Path,
+        default=Path("data/learning-summary.txt"),
+        help="Plain-English summary output path.",
+    )
+
+    promote_parser = subcommands.add_parser(
+        "promote-learned-policy",
+        help="Compare an unweighted policy against learned weights and mark promotion status.",
+    )
+    promote_parser.add_argument("--pack", type=Path, required=True)
+    promote_parser.add_argument("--edopro-home", type=Path, required=True)
+    promote_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    promote_parser.add_argument("--policy", default="heuristic")
+    promote_parser.add_argument("--learned-policy", type=Path, required=True)
+    promote_parser.add_argument("--games-per-matchup", type=int, default=5)
+    promote_parser.add_argument("--max-decisions", type=int, default=None)
+    promote_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    promote_parser.add_argument("--promote-to", type=Path, default=None)
+    promote_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/promotion-report.json"),
+    )
+
+    loop_parser = subcommands.add_parser(
+        "train-learn-promote",
+        help="Run training, learn from the report, then benchmark promotion in one loop.",
+    )
+    loop_parser.add_argument("--pack", type=Path, required=True)
+    loop_parser.add_argument("--edopro-home", type=Path, required=True)
+    loop_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    loop_parser.add_argument("--policy", default="heuristic")
+    loop_parser.add_argument("--current-policy", type=Path, default=Path("data/promoted-policy.json"))
+    loop_parser.add_argument("--candidate-policy", type=Path, default=None)
+    loop_parser.add_argument("--promote-to", type=Path, default=None)
+    loop_parser.add_argument("--games-per-matchup", type=int, default=5)
+    loop_parser.add_argument("--promotion-games-per-matchup", type=int, default=None)
+    loop_parser.add_argument("--max-decisions", type=int, default=None)
+    loop_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    loop_parser.add_argument("--output-dir", type=Path, default=Path("data/learning-loop"))
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -229,6 +298,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             agent_a_policy=args.agent_a_policy,
             agent_b_policy=args.agent_b_policy,
+            agent_a_weights=args.agent_a_weights,
+            agent_b_weights=args.agent_b_weights,
         )
     if args.command == "train-format":
         return _train_format(
@@ -251,6 +322,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             agent_a_policy=args.agent_a_policy,
             agent_b_policy=args.agent_b_policy,
+            agent_a_weights=args.agent_a_weights,
+            agent_b_weights=args.agent_b_weights,
         )
     if args.command == "compare-agents":
         return _compare_agents(
@@ -259,6 +332,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             gateway_script=args.gateway_script,
             candidate_policy=args.candidate_policy,
             baseline_policy=args.baseline_policy,
+            candidate_weights=args.candidate_weights,
+            baseline_weights=args.baseline_weights,
             games_per_matchup=args.games_per_matchup,
             max_decisions=args.max_decisions,
             timeout_seconds=args.timeout_seconds,
@@ -276,7 +351,163 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             output=args.output,
         )
+    if args.command == "learn-from-report":
+        return _learn_from_report(args.report, policy=args.policy, summary=args.summary)
+    if args.command == "promote-learned-policy":
+        return _promote_learned_policy(
+            args.pack,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            policy=args.policy,
+            learned_policy=args.learned_policy,
+            games_per_matchup=args.games_per_matchup,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            promote_to=args.promote_to,
+            output=args.output,
+        )
+    if args.command == "train-learn-promote":
+        return _train_learn_promote(
+            args.pack,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            policy=args.policy,
+            current_policy=args.current_policy,
+            candidate_policy=args.candidate_policy,
+            promote_to=args.promote_to,
+            games_per_matchup=args.games_per_matchup,
+            promotion_games_per_matchup=args.promotion_games_per_matchup,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            output_dir=args.output_dir,
+        )
     raise ValueError(f"Unknown command {args.command!r}.")
+
+
+def _learn_from_report(report: Path, *, policy: Path, summary: Path) -> int:
+    _analysis, english = learn_from_report(report, policy)
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text(english, encoding="utf-8")
+    print(english)
+    return 0
+
+
+def _promote_learned_policy(
+    pack: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    policy: str,
+    learned_policy: Path,
+    games_per_matchup: int,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    promote_to: Path | None,
+    output: Path,
+) -> int:
+    comparison = _compare_agents_report(
+        pack,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        candidate_policy=policy,
+        baseline_policy=policy,
+        candidate_weights=learned_policy,
+        baseline_weights=None,
+        games_per_matchup=games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+    )
+    candidate_wins = int(comparison["candidate_wins"])
+    baseline_wins = int(comparison["baseline_wins"])
+    candidate_rate = float(comparison["candidate_win_rate"])
+    baseline_rate = float(comparison["baseline_win_rate"])
+    promotable = candidate_wins > baseline_wins and candidate_rate >= baseline_rate
+    promoted_to: str | None = None
+    if promotable and promote_to is not None:
+        promote_to.parent.mkdir(parents=True, exist_ok=True)
+        promote_to.write_text(learned_policy.read_text(encoding="utf-8"), encoding="utf-8")
+        promoted_to = str(promote_to)
+
+    report = {
+        "policy": policy,
+        "learned_policy": str(learned_policy),
+        "promotable": promotable,
+        "promoted_to": promoted_to,
+        "reason": (
+            "Learned weights beat the unweighted policy."
+            if promotable
+            else "Learned weights did not beat the unweighted policy; do not promote yet."
+        ),
+        "comparison": comparison,
+    }
+    _write_report(output, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _train_learn_promote(
+    pack: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    policy: str,
+    current_policy: Path,
+    candidate_policy: Path | None,
+    promote_to: Path | None,
+    games_per_matchup: int,
+    promotion_games_per_matchup: int | None,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    output_dir: Path,
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    training_report = output_dir / "format-training-report.json"
+    learning_summary = output_dir / "learning-summary.txt"
+    promotion_report = output_dir / "promotion-report.json"
+    candidate_policy = candidate_policy or output_dir / "learned-policy.json"
+    promote_to = promote_to or output_dir / "promoted-policy.json"
+    current_weights = current_policy if current_policy.exists() else None
+
+    _train_format_pack(
+        pack,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        games_per_matchup=games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+        output=training_report,
+        agent_a_policy=policy,
+        agent_b_policy=policy,
+        agent_a_weights=current_weights,
+        agent_b_weights=current_weights,
+    )
+    _learn_from_report(training_report, policy=candidate_policy, summary=learning_summary)
+    _promote_learned_policy(
+        pack,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        policy=policy,
+        learned_policy=candidate_policy,
+        games_per_matchup=promotion_games_per_matchup or games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+        promote_to=promote_to,
+        output=promotion_report,
+    )
+
+    loop_report = {
+        "pack": str(pack),
+        "policy": policy,
+        "used_current_policy": str(current_weights) if current_weights else None,
+        "candidate_policy": str(candidate_policy),
+        "promote_to": str(promote_to),
+        "training_report": str(training_report),
+        "learning_summary": str(learning_summary),
+        "promotion_report": str(promotion_report),
+    }
+    _write_report(output_dir / "loop-report.json", loop_report)
+    print(json.dumps(loop_report, indent=2, sort_keys=True))
+    return 0
 
 
 def _fetch_cards(cache_path: Path) -> int:
@@ -367,6 +598,8 @@ def _edopro_train(
     format_name: str | None = None,
     agent_a_policy: str = "first-legal",
     agent_b_policy: str = "first-legal",
+    agent_a_weights: Path | None = None,
+    agent_b_weights: Path | None = None,
 ) -> int:
     report = _collect_edopro_training_report(
         gateway_command,
@@ -377,6 +610,8 @@ def _edopro_train(
         format_name=format_name,
         agent_a_policy=agent_a_policy,
         agent_b_policy=agent_b_policy,
+        agent_a_weights=agent_a_weights,
+        agent_b_weights=agent_b_weights,
     )
     report_json = json.dumps(report, indent=2, sort_keys=True)
     if output is not None:
@@ -396,12 +631,16 @@ def _collect_edopro_training_report(
     format_name: str | None = None,
     agent_a_policy: str = "first-legal",
     agent_b_policy: str = "first-legal",
+    agent_a_weights: Path | None = None,
+    agent_b_weights: Path | None = None,
 ) -> dict[str, object]:
     if games < 1:
         raise ValueError("games must be at least 1.")
 
     wins_by_agent: dict[str, int] = {}
     tags: dict[str, int] = {}
+    loaded_agent_a_weights = _load_policy_weights(agent_a_weights)
+    loaded_agent_b_weights = _load_policy_weights(agent_b_weights)
     action_counts: dict[str, int] = {}
     decision_samples: list[dict[str, object]] = []
     engine_log_samples: list[object] = []
@@ -414,8 +653,8 @@ def _collect_edopro_training_report(
             timeout_seconds=timeout_seconds,
         )
         result = JsonLineEdoproSimulator(config).play(
-            create_agent(agent_a_policy, first_agent),
-            create_agent(agent_b_policy, second_agent),
+            create_agent(agent_a_policy, first_agent, loaded_agent_a_weights),
+            create_agent(agent_b_policy, second_agent, loaded_agent_b_weights),
         )
         total_decisions += len(result.traces)
         for log_entry in result.metadata.get("gateway_logs", ()):
@@ -455,6 +694,8 @@ def _collect_edopro_training_report(
         "draws": draws,
         "agent_a_policy": agent_a_policy,
         "agent_b_policy": agent_b_policy,
+        "agent_a_weights": str(agent_a_weights) if agent_a_weights else None,
+        "agent_b_weights": str(agent_b_weights) if agent_b_weights else None,
         "traced_decisions": total_decisions,
         "wins_by_agent": wins_by_agent,
         "tags": tags,
@@ -475,6 +716,8 @@ def _train_format(
     output: Path,
     agent_a_policy: str = "heuristic",
     agent_b_policy: str = "heuristic",
+    agent_a_weights: Path | None = None,
+    agent_b_weights: Path | None = None,
 ) -> int:
     config = load_format_training_config(config_path)
     run_games = games if games is not None else config.games
@@ -517,6 +760,8 @@ def _train_format_pack(
     output: Path,
     agent_a_policy: str = "heuristic",
     agent_b_policy: str = "heuristic",
+    agent_a_weights: Path | None = None,
+    agent_b_weights: Path | None = None,
 ) -> int:
     pack = load_format_pack(pack_path)
     run_games = games_per_matchup if games_per_matchup is not None else pack.games
@@ -543,6 +788,8 @@ def _train_format_pack(
                 format_name=pack.name,
                 agent_a_policy=agent_a_policy,
                 agent_b_policy=agent_b_policy,
+                agent_a_weights=agent_a_weights,
+                agent_b_weights=agent_b_weights,
             )
             total_games += int(report["games"])
             total_decisions += int(report["traced_decisions"])
@@ -576,6 +823,8 @@ def _train_format_pack(
         "games_per_matchup": run_games,
         "agent_a_policy": agent_a_policy,
         "agent_b_policy": agent_b_policy,
+        "agent_a_weights": str(agent_a_weights) if agent_a_weights else None,
+        "agent_b_weights": str(agent_b_weights) if agent_b_weights else None,
         "max_decisions": run_max_decisions,
         "total_games": total_games,
         "total_traced_decisions": total_decisions,
@@ -596,6 +845,8 @@ def _compare_agents(
     gateway_script: Path,
     candidate_policy: str,
     baseline_policy: str,
+    candidate_weights: Path | None,
+    baseline_weights: Path | None,
     games_per_matchup: int,
     max_decisions: int | None,
     timeout_seconds: float,
@@ -607,6 +858,8 @@ def _compare_agents(
         gateway_script=gateway_script,
         candidate_policy=candidate_policy,
         baseline_policy=baseline_policy,
+        candidate_weights=candidate_weights,
+        baseline_weights=baseline_weights,
         games_per_matchup=games_per_matchup,
         max_decisions=max_decisions,
         timeout_seconds=timeout_seconds,
@@ -653,6 +906,8 @@ def _benchmark_agents(
     benchmark = {
         "pack": str(pack_path),
         "baseline_policy": baseline_policy,
+        "candidate_weights": str(candidate_weights) if candidate_weights else None,
+        "baseline_weights": str(baseline_weights) if baseline_weights else None,
         "games_per_matchup": games_per_matchup,
         "ranked_policies": [
             {
@@ -680,7 +935,9 @@ def _compare_agents_report(
     gateway_script: Path,
     candidate_policy: str,
     baseline_policy: str,
-    games_per_matchup: int,
+    candidate_weights: Path | None = None,
+    baseline_weights: Path | None = None,
+    games_per_matchup: int = 5,
     max_decisions: int | None,
     timeout_seconds: float,
 ) -> dict[str, object]:
@@ -711,6 +968,8 @@ def _compare_agents_report(
                 format_name=pack.name,
                 agent_a_policy=candidate_policy,
                 agent_b_policy=baseline_policy,
+                agent_a_weights=candidate_weights,
+                agent_b_weights=baseline_weights,
             )
             baseline_first = _collect_edopro_training_report(
                 command,
@@ -721,6 +980,8 @@ def _compare_agents_report(
                 format_name=pack.name,
                 agent_a_policy=baseline_policy,
                 agent_b_policy=candidate_policy,
+                agent_a_weights=baseline_weights,
+                agent_b_weights=candidate_weights,
             )
 
             for report in (candidate_first, baseline_first):
@@ -745,6 +1006,8 @@ def _compare_agents_report(
         "format": pack.name,
         "candidate_policy": candidate_policy,
         "baseline_policy": baseline_policy,
+        "candidate_weights": str(candidate_weights) if candidate_weights else None,
+        "baseline_weights": str(baseline_weights) if baseline_weights else None,
         "games_per_matchup": games_per_matchup,
         "max_decisions": run_max_decisions,
         "total_games": total_games,
@@ -762,6 +1025,18 @@ def _compare_agents_report(
 def _write_report(output: Path, report: dict[str, object]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+def _load_policy_weights(policy_path: Path | None) -> dict[str, float] | None:
+    if policy_path is None:
+        return None
+    if not policy_path.exists():
+        raise ValueError(f"learned policy does not exist: {policy_path}")
+    payload = json.loads(policy_path.read_text(encoding="utf-8"))
+    return {
+        str(tag): float(weight)
+        for tag, weight in dict(payload.get("tag_weights", {})).items()
+    }
+
 
 def _gateway_command_for_decks(
     gateway_script: Path,

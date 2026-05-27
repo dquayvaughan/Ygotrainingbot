@@ -101,8 +101,9 @@ class ScoredHeuristicAgent:
         "no": -5,
     }
 
-    def __init__(self, name: str = "heuristic") -> None:
+    def __init__(self, name: str = "heuristic", learned_weights: dict[str, float] | None = None) -> None:
         self._name = name
+        self._learned_weights = learned_weights or {}
 
     @property
     def name(self) -> str:
@@ -155,6 +156,7 @@ class ScoredHeuristicAgent:
         score = action.expected_value or 0.0
         for tag in action.tags:
             score += self.TAG_SCORES.get(tag, 0)
+            score += self._learned_weights.get(tag, 0.0)
             if tag.startswith("damage:"):
                 score += _numeric_tag_value(tag) * self.damage_weight
             elif tag.startswith("lp-swing:"):
@@ -183,8 +185,8 @@ class ScoredHeuristicAgent:
 class HeuristicActionAgent(ScoredHeuristicAgent):
     """Compatibility alias for the first proactive policy."""
 
-    def __init__(self, name: str = "heuristic-aggressive") -> None:
-        super().__init__(name)
+    def __init__(self, name: str = "heuristic-aggressive", learned_weights: dict[str, float] | None = None) -> None:
+        super().__init__(name, learned_weights)
 
 
 class AggressiveHeuristicAgent(ScoredHeuristicAgent):
@@ -244,7 +246,11 @@ class ControlHeuristicAgent(ScoredHeuristicAgent):
     }
 
 
-def create_agent(policy: str, name: str | None = None) -> DuelAgent:
+def create_agent(
+    policy: str,
+    name: str | None = None,
+    learned_weights: dict[str, float] | None = None,
+) -> DuelAgent:
     """Create an agent by policy slug."""
 
     normalized = policy.strip().lower()
@@ -253,13 +259,13 @@ def create_agent(policy: str, name: str | None = None) -> DuelAgent:
     if normalized in {"random", "random-legal"}:
         return RandomLegalActionAgent(name or "random-legal")
     if normalized in {"heuristic", "heuristic-aggressive"}:
-        return HeuristicActionAgent(name or "heuristic-aggressive")
+        return HeuristicActionAgent(name or "heuristic-aggressive", learned_weights)
     if normalized in {"aggressive", "aggressive-heuristic"}:
-        return AggressiveHeuristicAgent(name or "aggressive-heuristic")
+        return AggressiveHeuristicAgent(name or "aggressive-heuristic", learned_weights)
     if normalized in {"tempo", "tempo-heuristic"}:
-        return TempoHeuristicAgent(name or "tempo-heuristic")
+        return TempoHeuristicAgent(name or "tempo-heuristic", learned_weights)
     if normalized in {"control", "control-heuristic"}:
-        return ControlHeuristicAgent(name or "control-heuristic")
+        return ControlHeuristicAgent(name or "control-heuristic", learned_weights)
     raise ValueError(f"Unknown agent policy {policy!r}.")
 
 
