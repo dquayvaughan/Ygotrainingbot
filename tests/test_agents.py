@@ -65,3 +65,22 @@ def test_random_agent_is_seeded() -> None:
 def test_create_agent_builds_benchmark_policies() -> None:
     for policy in ["random", "aggressive", "tempo", "control"]:
         assert create_agent(policy, policy).name == policy
+
+
+def test_control_agent_prefers_removal_chain_over_decline() -> None:
+    decline = GameAction("decline-chain", "Do not chain", tags=("chain", "decline"))
+    removal = GameAction(
+        "chain-0",
+        "Chain Sakuretsu Armor",
+        expected_value=3.5,
+        tags=("chain", "trap", "removal", "destroy-monster", "battle-trap"),
+    )
+    state = VisibleGameState(
+        state_id="attack-response",
+        turn=4,
+        active_player="bot-b",
+        summary="Opponent declared an attack.",
+        legal_actions=(decline, removal),
+    )
+
+    assert create_agent("control").choose_action(state) == removal

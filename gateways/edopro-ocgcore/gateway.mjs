@@ -210,11 +210,19 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
         { action_id: "yes", label: "Yes", tags: ["yes-no"], response: { type: OcgResponseType.SELECT_YESNO, yes: true } },
         { action_id: "no", label: "No", tags: ["yes-no"], response: { type: OcgResponseType.SELECT_YESNO, yes: false } },
       ];
-    case OcgMessageType.SELECT_EFFECTYN:
+    case OcgMessageType.SELECT_EFFECTYN: {
+      const tags = ["effect", ...effectTagsForCard(message.code)];
       return [
-        { action_id: "activate-effect", label: `Activate ${cardName(message.code)}`, tags: ["effect"], response: { type: OcgResponseType.SELECT_EFFECTYN, yes: true } },
-        { action_id: "decline-effect", label: "Do not activate", tags: ["effect"], response: { type: OcgResponseType.SELECT_EFFECTYN, yes: false } },
+        {
+          action_id: "activate-effect",
+          label: `Activate ${cardName(message.code)} - ${shortCardText(message.code)}`,
+          expected_value: expectedValueForTags(tags),
+          tags,
+          response: { type: OcgResponseType.SELECT_EFFECTYN, yes: true },
+        },
+        { action_id: "decline-effect", label: "Do not activate", tags: ["effect", "decline"], response: { type: OcgResponseType.SELECT_EFFECTYN, yes: false } },
       ];
+    }
     default:
       return [];
   }
@@ -242,24 +250,36 @@ function idleActions(message, lifePoints) {
     tags: ["special-summon"],
     response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPECIAL_SUMMON, index },
   }));
-  message.activates.forEach((card, index) => actions.push({
-    action_id: `activate-${index}`,
-    label: `Activate ${cardName(card.code)}`,
-    tags: ["activate"],
-    response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_ACTIVATE, index },
-  }));
-  message.monster_sets.forEach((card, index) => actions.push({
-    action_id: `set-monster-${index}`,
-    label: `Set ${cardName(card.code)}`,
-    tags: ["set-monster"],
-    response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_MONSTER_SET, index },
-  }));
-  message.spell_sets.forEach((card, index) => actions.push({
-    action_id: `set-spell-${index}`,
-    label: `Set ${cardName(card.code)}`,
-    tags: ["set-spell"],
-    response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPELL_SET, index },
-  }));
+  message.activates.forEach((card, index) => {
+    const tags = ["activate", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `activate-${index}`,
+      label: `Activate ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_ACTIVATE, index },
+    });
+  });
+  message.monster_sets.forEach((card, index) => {
+    const tags = ["set-monster", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `set-monster-${index}`,
+      label: `Set ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_MONSTER_SET, index },
+    });
+  });
+  message.spell_sets.forEach((card, index) => {
+    const tags = ["set-spell", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `set-spell-${index}`,
+      label: `Set ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPELL_SET, index },
+    });
+  });
   return actions;
 }
 
@@ -293,12 +313,16 @@ function battleActions(message, lifePoints) {
       response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_BATTLE, index },
     });
   });
-  message.chains.forEach((card, index) => actions.push({
-    action_id: `battle-chain-${index}`,
-    label: `Activate ${cardName(card.code)}`,
-    tags: ["chain"],
-    response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_CHAIN, index },
-  }));
+  message.chains.forEach((card, index) => {
+    const tags = ["chain", "battle-chain", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `battle-chain-${index}`,
+      label: `Activate ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_CHAIN, index },
+    });
+  });
   return actions;
 }
 
@@ -352,16 +376,64 @@ function decodeFieldMask(fieldMask, count, activePlayer) {
 function chainActions(message) {
   const actions = [];
   if (!message.forced) {
-    actions.push({ action_id: "decline-chain", label: "Do not chain", tags: ["chain"], response: { type: OcgResponseType.SELECT_CHAIN, index: null } });
+    actions.push({ action_id: "decline-chain", label: "Do not chain", tags: ["chain", "decline"], response: { type: OcgResponseType.SELECT_CHAIN, index: null } });
   }
-  message.selects.forEach((card, index) => actions.push({
-    action_id: `chain-${index}`,
-    label: `Chain ${cardName(card.code)}`,
-    tags: ["chain"],
-    response: { type: OcgResponseType.SELECT_CHAIN, index },
-  }));
+  message.selects.forEach((card, index) => {
+    const tags = ["chain", ...effectTagsForCard(card.code)];
+    if (message.forced) {
+      tags.push("forced");
+    }
+    actions.push({
+      action_id: `chain-${index}`,
+      label: `Chain ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_CHAIN, index },
+    });
+  });
   return actions;
 }
+
+function effectTagsForCard(code) {
+  const text = `${cardName(code)} ${cardText(code)}`.toLowerCase();
+  const type = database.type(code);
+  const tags = [];
+  if ((type & 0x4) !== 0) tags.push("trap");
+  if ((type & 0x2) !== 0) tags.push("spell");
+  if ((type & 0x1) !== 0) tags.push("monster");
+  if (matchesAny(text, ["destroy", "破坏", "破壞"])) tags.push("removal", "destroy-monster");
+  if (matchesAny(text, ["negate", "无效", "無效"])) tags.push("negate");
+  if (matchesAny(text, ["attack", "攻击", "攻擊", "battle"])) tags.push("battle-trap");
+  if (matchesAny(text, ["banish", "除外"])) tags.push("banish", "removal");
+  if (matchesAny(text, ["draw", "抽卡", "抽" ])) tags.push("draw");
+  if (matchesAny(text, ["add 1", "from your deck", "从卡组", "從牌組", "加入手卡", "加入手牌"])) tags.push("search");
+  if (matchesAny(text, ["special summon", "特殊召唤", "特殊召喚"])) tags.push("special-summon");
+  if (matchesAny(text, ["cannot be destroyed", "不会被破坏", "不會被破壞", "代替破坏", "代替破壞"])) tags.push("protect");
+  return [...new Set(tags)];
+}
+
+function expectedValueForTags(tags) {
+  let value = 0;
+  if (tags.includes("lethal")) value += 100;
+  if (tags.includes("negate")) value += 4;
+  if (tags.includes("removal")) value += 3.5;
+  if (tags.includes("battle-trap")) value += 3;
+  if (tags.includes("protect")) value += 2.5;
+  if (tags.includes("search")) value += 2;
+  if (tags.includes("draw")) value += 2;
+  if (tags.includes("banish")) value += 1.5;
+  return value || null;
+}
+
+function matchesAny(text, needles) {
+  return needles.some((needle) => text.includes(needle));
+}
+
+function shortCardText(code) {
+  const text = cardText(code).replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 120) : "no effect text";
+}
+
 
 async function addDeck(core, duelHandle, team, cards) {
   await Promise.all(cards.map((code, sequence) => core.duelNewCard(duelHandle, {
@@ -484,6 +556,10 @@ function cardAttack(code) {
   return database.attack(code);
 }
 
+function cardText(code) {
+  return database.text(code);
+}
+
 function playerName(playerIndex) {
   return players[playerIndex] ?? `player-${playerIndex}`;
 }
@@ -588,7 +664,9 @@ class CardDatabase {
     this.database = new Database(databasePath, { readonly: true });
     this.dataStatement = this.database.prepare("select * from datas where id = ?");
     this.nameStatement = this.database.prepare("select name from texts where id = ?");
+    this.textStatement = this.database.prepare("select desc from texts where id = ?");
     this.names = new Map();
+    this.texts = new Map();
   }
 
   row(code) {
@@ -627,6 +705,17 @@ class CardDatabase {
 
   attack(code) {
     return this.row(code)?.atk ?? 0;
+  }
+
+  type(code) {
+    return this.row(code)?.type ?? 0;
+  }
+
+  text(code) {
+    if (!this.texts.has(code)) {
+      this.texts.set(code, this.textStatement.get(code)?.desc ?? "");
+    }
+    return this.texts.get(code);
   }
 }
 
