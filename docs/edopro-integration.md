@@ -5,6 +5,12 @@ client is primarily a graphical application. The bot connects through a
 headless gateway process that uses EDOPro/ocgcore-compatible data and streams
 legal decision points over JSON lines.
 
+Bootstrap an EDOPro-compatible data directory with:
+
+```bash
+scripts/bootstrap_edopro_home.sh /tmp/ygotrain/edopro-home
+```
+
 ## Validate a local EDOPro directory
 
 Point the bot at an EDOPro install or extracted data directory:
@@ -64,11 +70,23 @@ When the duel is over, the gateway sends:
 {"type":"result","winner":"bot-a","loser":"bot-b","turns":4,"tags":["edopro"]}
 ```
 
-Run one connected duel with:
+Run one connected duel with the included ocgcore WASM gateway:
 
 ```bash
+cd gateways/edopro-ocgcore
+npm install
+cd ../..
 python3 -m ygotrainingbot.cli edopro-play-once \
-  --gateway-command "node /path/to/edopro-gateway.js"
+  --gateway-command "node gateways/edopro-ocgcore/gateway.mjs --edopro-home /path/to/edopro-home"
+```
+
+Run repeated gameplay training and save a report:
+
+```bash
+python3 -m ygotrainingbot.cli edopro-train \
+  --gateway-command "node gateways/edopro-ocgcore/gateway.mjs --edopro-home /path/to/edopro-home --max-decisions 40" \
+  --games 25 \
+  --output data/edopro-training-report.json
 ```
 
 ## What the gateway must own
@@ -88,3 +106,16 @@ The Python bot remains responsible for:
 - training policies,
 - generating coach feedback,
 - benchmarking agent versions.
+
+## Quick local bootstrap used by this agent
+
+For the current smoke run, the EDOPro resources were assembled under `/tmp/ygotrain/edopro-home` from public script/database repositories, then exercised with:
+
+```bash
+python3 -m ygotrainingbot.cli edopro-train \
+  --gateway-command "node gateways/edopro-ocgcore/gateway.mjs --edopro-home /tmp/ygotrain/edopro-home --max-decisions 20" \
+  --games 5 \
+  --output /tmp/ygotrain/edopro-training-report.json
+```
+
+The included gateway currently uses simple normal-monster starter decks by default. The next improvement is passing generated deck lists from the static set miner into the gateway.

@@ -82,6 +82,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     edopro_once_parser.add_argument("--second-agent", default="bot-b")
     edopro_once_parser.add_argument("--timeout-seconds", type=float, default=30.0)
 
+    edopro_train_parser = subcommands.add_parser(
+        "edopro-train",
+        help="Run repeated duels through a JSON-lines EDOPro headless gateway.",
+    )
+    edopro_train_parser.add_argument(
+        "--gateway-command",
+        required=True,
+        help="Command that starts the EDOPro-core-compatible JSON-lines gateway.",
+    )
+    edopro_train_parser.add_argument("--games", type=int, default=10)
+    edopro_train_parser.add_argument("--first-agent", default="bot-a")
+    edopro_train_parser.add_argument("--second-agent", default="bot-b")
+    edopro_train_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    edopro_train_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional JSON file for the gameplay training report.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -100,6 +120,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             first_agent=args.first_agent,
             second_agent=args.second_agent,
             timeout_seconds=args.timeout_seconds,
+        )
+    if args.command == "edopro-train":
+        return _edopro_train(
+            args.gateway_command,
+            games=args.games,
+            first_agent=args.first_agent,
+            second_agent=args.second_agent,
+            timeout_seconds=args.timeout_seconds,
+            output=args.output,
         )
     raise ValueError(f"Unknown command {args.command!r}.")
 
@@ -178,6 +207,58 @@ def _edopro_play_once(
             sort_keys=True,
         )
     )
+    return 0
+
+
+def _edopro_train(
+    gateway_command: str,
+    *,
+    games: int,
+    first_agent: str,
+    second_agent: str,
+    timeout_seconds: float,
+    output: Path | None,
+) -> int:
+    if games < 1:
+        raise ValueError("games must be at least 1.")
+
+    wins_by_agent: dict[str, int] = {}
+    tags: dict[str, int] = {}
+    total_decisions = 0
+    draws = 0
+
+    for _ in range(games):
+        config = EdoproGatewayConfig.from_shell_words(
+            shlex.split(gateway_command),
+            timeout_seconds=timeout_seconds,
+        )
+        result = JsonLineEdoproSimulator(config).play(
+            FirstLegalActionAgent(first_agent),
+            FirstLegalActionAgent(second_agent),
+        )
+        total_decisions += len(result.traces)
+        if result.winner is None:
+            draws += 1
+        else:
+            wins_by_agent[result.winner] = wins_by_agent.get(result.winner, 0) + 1
+        for tag in result.tags:
+            tags[tag] = tags.get(tag, 0) + 1
+        for trace in result.traces:
+            for tag in trace.action.tags:
+                tags[tag] = tags.get(tag, 0) + 1
+
+    report = {
+        "games": games,
+        "draws": draws,
+        "traced_decisions": total_decisions,
+        "wins_by_agent": wins_by_agent,
+        "tags": tags,
+    }
+    report_json = json.dumps(report, indent=2, sort_keys=True)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report_json + "\n", encoding="utf-8")
+    print(report_json)
     return 0
 
 

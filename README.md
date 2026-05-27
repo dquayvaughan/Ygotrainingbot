@@ -40,17 +40,35 @@ If the console script is not on `PATH`, use `python3 -m ygotrainingbot.cli` with
 
 `fetch-cards` refreshes the local cache from the current public card database. `train-static` groups those cards by set and mines archetypes, effect signals, and likely interaction candidates that later simulator runs should verify.
 
+Bootstrap an EDOPro-compatible data directory with:
+
+```bash
+scripts/bootstrap_edopro_home.sh /tmp/ygotrain/edopro-home
+```
+
 Validate an EDOPro install or data directory with:
 
 ```bash
 python3 -m ygotrainingbot.cli check-edopro --root /path/to/ProjectIgnis
 ```
 
-Run one connected duel through an EDOPro-core-compatible JSON-lines gateway with:
+Run one connected duel through the included ocgcore WASM gateway with:
 
 ```bash
+cd gateways/edopro-ocgcore
+npm install
+cd ../..
 python3 -m ygotrainingbot.cli edopro-play-once \
-  --gateway-command "node /path/to/edopro-gateway.js"
+  --gateway-command "node gateways/edopro-ocgcore/gateway.mjs --edopro-home /path/to/edopro-home"
+```
+
+Run repeated gameplay training with:
+
+```bash
+python3 -m ygotrainingbot.cli edopro-train \
+  --gateway-command "node gateways/edopro-ocgcore/gateway.mjs --edopro-home /path/to/edopro-home --max-decisions 40" \
+  --games 25 \
+  --output data/edopro-training-report.json
 ```
 
 ## Current status

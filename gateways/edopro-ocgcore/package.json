@@ -1,0 +1,22 @@
+{
+  "name": "@ygotrainingbot/edopro-ocgcore-gateway",
+  "version": "0.1.0",
+  "description": "JSON-lines gateway from ygotrainingbot agents to EDOPro ocgcore WASM.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node ./gateway.mjs",
+    "smoke": "node ./gateway.mjs --max-decisions 8"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "ocgcore-wasm": "^0.1.2"
+  },
+  "type": "module",
+  "private": true,
+  "bin": {
+    "ygotrain-edopro-gateway": "./gateway.mjs"
+  }
+}
