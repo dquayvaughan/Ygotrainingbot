@@ -112,3 +112,18 @@ ygotrain-dashboard --host 0.0.0.0 --port 8765
 ```
 
 Use the forwarded/public URL from your iPhone to launch jobs, watch logs, and open training reports.
+
+## Agent comparisons
+
+Prove a policy beats the baseline with a win-rate report:
+
+```bash
+python3 -m ygotrainingbot.cli compare-agents \
+  --pack configs/format-packs/proof-normal-baseline.json \
+  --edopro-home /path/to/edopro-home \
+  --candidate-policy heuristic \
+  --baseline-policy first-legal \
+  --games-per-matchup 10 \
+  --max-decisions 200 \
+  --output data/agent-comparison-report.json
+```
