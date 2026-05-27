@@ -177,9 +177,11 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
       return message.selects.map((card, index) => ({
         action_id: `select-card-${index}`,
         label: `Select ${cardName(card.code)}`,
-        tags: ["select-card"],
+        tags: ["select-card", ...effectTagsForCard(card.code)],
         response: { type: OcgResponseType.SELECT_CARD, indicies: [index] },
       }));
+    case OcgMessageType.SELECT_UNSELECT_CARD:
+      return selectUnselectActions(message);
     case OcgMessageType.SELECT_TRIBUTE:
       return message.selects.map((card, index) => ({
         action_id: `select-tribute-${index}`,
@@ -321,6 +323,47 @@ function battleActions(message, lifePoints) {
       expected_value: expectedValueForTags(tags),
       tags,
       response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_CHAIN, index },
+    });
+  });
+  return actions;
+}
+
+
+function selectUnselectActions(message) {
+  const actions = [];
+  if (message.can_cancel) {
+    actions.push({
+      action_id: "cancel-selection",
+      label: "Cancel selection",
+      tags: ["select-unselect", "decline"],
+      response: { type: OcgResponseType.SELECT_UNSELECT_CARD, index: null },
+    });
+  }
+  if (message.can_finish) {
+    actions.push({
+      action_id: "finish-selection",
+      label: "Finish selection",
+      tags: ["select-unselect", "finish"],
+      response: { type: OcgResponseType.SELECT_UNSELECT_CARD, index: null },
+    });
+  }
+  message.select_cards.forEach((card, index) => {
+    const tags = ["select-unselect", "select-card", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `select-unselect-card-${index}`,
+      label: `Select ${cardName(card.code)} - ${shortCardText(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_UNSELECT_CARD, index },
+    });
+  });
+  message.unselect_cards.forEach((card, index) => {
+    const responseIndex = message.select_cards.length + index;
+    actions.push({
+      action_id: `unselect-card-${index}`,
+      label: `Unselect ${cardName(card.code)}`,
+      tags: ["select-unselect", "unselect"],
+      response: { type: OcgResponseType.SELECT_UNSELECT_CARD, index: responseIndex },
     });
   });
   return actions;
