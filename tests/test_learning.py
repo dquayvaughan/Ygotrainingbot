@@ -65,3 +65,19 @@ def test_learn_from_report_writes_policy_and_plain_english(tmp_path: Path) -> No
     assert policy["observations"] == 2
     assert policy["tag_weights"]["phase"] < 0
     assert policy["tag_weights"]["attack"] > 0
+
+
+def test_learned_policy_contains_version_metadata(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    policy_path = tmp_path / "policy.json"
+    report_path.write_text(
+        json.dumps({"format": "empty", "games": 0, "draws": 0, "traced_decisions": 0}),
+        encoding="utf-8",
+    )
+
+    learn_from_report(report_path, policy_path)
+
+    policy = json.loads(policy_path.read_text())
+    assert policy["version"] >= 1
+    assert "updated_at" in policy
+    assert "parent_observations" in policy

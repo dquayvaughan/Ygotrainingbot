@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,9 @@ def learn_from_report(report_path: Path, policy_path: Path | None = None) -> tup
                 {
                     "tag_weights": learned.tag_weights,
                     "observations": learned.observations,
+                    "version": _next_version(previous),
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "parent_observations": previous.observations,
                 },
                 indent=2,
                 sort_keys=True,
@@ -271,6 +275,10 @@ def _update_policy(previous: LearnedPolicy, analysis: dict[str, Any]) -> Learned
         weights["removal"] += 0.25
         weights["negate"] += 0.25
     return LearnedPolicy(tag_weights=dict(sorted(weights.items())), observations=previous.observations + int(analysis["total_decisions"]))
+
+
+def _next_version(previous: LearnedPolicy) -> int:
+    return max(1, previous.observations + 1)
 
 
 def _load_policy(policy_path: Path | None) -> LearnedPolicy:

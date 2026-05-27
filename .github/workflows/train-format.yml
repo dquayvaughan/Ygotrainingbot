@@ -19,6 +19,14 @@ on:
         description: "Optional repo path to learned-policy.json for both agents"
         required: false
         default: ""
+      run_promotion:
+        description: "Run before/after promotion comparison after learning"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   train-format:
@@ -53,21 +61,37 @@ jobs:
       - name: Train format pack
         run: |
           mkdir -p artifacts
-          EXTRA_ARGS=""
-          if [ -n "${{ inputs.learned_policy }}" ]; then
-            EXTRA_ARGS="--agent-a-weights ${{ inputs.learned_policy }} --agent-b-weights ${{ inputs.learned_policy }}"
+          if [ "${{ inputs.run_promotion }}" = "true" ]; then
+            CURRENT_POLICY="${{ inputs.learned_policy }}"
+            if [ -z "$CURRENT_POLICY" ]; then
+              CURRENT_POLICY="artifacts/current-policy.json"
+            fi
+            python -m ygotrainingbot.cli train-learn-promote \
+              --pack "${{ inputs.format_pack }}" \
+              --edopro-home /tmp/ygotrain/edopro-home \
+              --games-per-matchup "${{ inputs.games_per_matchup }}" \
+              --max-decisions "${{ inputs.max_decisions }}" \
+              --current-policy "$CURRENT_POLICY" \
+              --candidate-policy artifacts/learned-policy.json \
+              --promote-to artifacts/promoted-policy.json \
+              --output-dir artifacts
+          else
+            EXTRA_ARGS=""
+            if [ -n "${{ inputs.learned_policy }}" ]; then
+              EXTRA_ARGS="--agent-a-weights ${{ inputs.learned_policy }} --agent-b-weights ${{ inputs.learned_policy }}"
+            fi
+            python -m ygotrainingbot.cli train-format-pack \
+              --pack "${{ inputs.format_pack }}" \
+              --edopro-home /tmp/ygotrain/edopro-home \
+              --games-per-matchup "${{ inputs.games_per_matchup }}" \
+              --max-decisions "${{ inputs.max_decisions }}" \
+              --output artifacts/format-training-report.json \
+              $EXTRA_ARGS
+            python -m ygotrainingbot.cli learn-from-report \
+              --report artifacts/format-training-report.json \
+              --policy artifacts/learned-policy.json \
+              --summary artifacts/learning-summary.txt
           fi
-          python -m ygotrainingbot.cli train-format-pack \
-            --pack "${{ inputs.format_pack }}" \
-            --edopro-home /tmp/ygotrain/edopro-home \
-            --games-per-matchup "${{ inputs.games_per_matchup }}" \
-            --max-decisions "${{ inputs.max_decisions }}" \
-            --output artifacts/format-training-report.json \
-            $EXTRA_ARGS
-          python -m ygotrainingbot.cli learn-from-report \
-            --report artifacts/format-training-report.json \
-            --policy artifacts/learned-policy.json \
-            --summary artifacts/learning-summary.txt
 
       - name: Upload training report
         uses: actions/upload-artifact@v4
@@ -77,3 +101,6 @@ jobs:
             artifacts/format-training-report.json
             artifacts/learning-summary.txt
             artifacts/learned-policy.json
+            artifacts/promoted-policy.json
+            artifacts/promotion-report.json
+            artifacts/loop-report.json

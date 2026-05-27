@@ -248,6 +248,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("data/promotion-report.json"),
     )
 
+    loop_parser = subcommands.add_parser(
+        "train-learn-promote",
+        help="Run training, learn from the report, then benchmark promotion in one loop.",
+    )
+    loop_parser.add_argument("--pack", type=Path, required=True)
+    loop_parser.add_argument("--edopro-home", type=Path, required=True)
+    loop_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    loop_parser.add_argument("--policy", default="heuristic")
+    loop_parser.add_argument("--current-policy", type=Path, default=Path("data/promoted-policy.json"))
+    loop_parser.add_argument("--candidate-policy", type=Path, default=None)
+    loop_parser.add_argument("--promote-to", type=Path, default=None)
+    loop_parser.add_argument("--games-per-matchup", type=int, default=5)
+    loop_parser.add_argument("--promotion-games-per-matchup", type=int, default=None)
+    loop_parser.add_argument("--max-decisions", type=int, default=None)
+    loop_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    loop_parser.add_argument("--output-dir", type=Path, default=Path("data/learning-loop"))
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -345,6 +366,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             promote_to=args.promote_to,
             output=args.output,
         )
+    if args.command == "train-learn-promote":
+        return _train_learn_promote(
+            args.pack,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            policy=args.policy,
+            current_policy=args.current_policy,
+            candidate_policy=args.candidate_policy,
+            promote_to=args.promote_to,
+            games_per_matchup=args.games_per_matchup,
+            promotion_games_per_matchup=args.promotion_games_per_matchup,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            output_dir=args.output_dir,
+        )
     raise ValueError(f"Unknown command {args.command!r}.")
 
 
@@ -406,6 +442,71 @@ def _promote_learned_policy(
     }
     _write_report(output, report)
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _train_learn_promote(
+    pack: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    policy: str,
+    current_policy: Path,
+    candidate_policy: Path | None,
+    promote_to: Path | None,
+    games_per_matchup: int,
+    promotion_games_per_matchup: int | None,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    output_dir: Path,
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    training_report = output_dir / "format-training-report.json"
+    learning_summary = output_dir / "learning-summary.txt"
+    promotion_report = output_dir / "promotion-report.json"
+    candidate_policy = candidate_policy or output_dir / "learned-policy.json"
+    promote_to = promote_to or output_dir / "promoted-policy.json"
+    current_weights = current_policy if current_policy.exists() else None
+
+    _train_format_pack(
+        pack,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        games_per_matchup=games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+        output=training_report,
+        agent_a_policy=policy,
+        agent_b_policy=policy,
+        agent_a_weights=current_weights,
+        agent_b_weights=current_weights,
+    )
+    _learn_from_report(training_report, policy=candidate_policy, summary=learning_summary)
+    _promote_learned_policy(
+        pack,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        policy=policy,
+        learned_policy=candidate_policy,
+        games_per_matchup=promotion_games_per_matchup or games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+        promote_to=promote_to,
+        output=promotion_report,
+    )
+
+    loop_report = {
+        "pack": str(pack),
+        "policy": policy,
+        "used_current_policy": str(current_weights) if current_weights else None,
+        "candidate_policy": str(candidate_policy),
+        "promote_to": str(promote_to),
+        "training_report": str(training_report),
+        "learning_summary": str(learning_summary),
+        "promotion_report": str(promotion_report),
+    }
+    _write_report(output_dir / "loop-report.json", loop_report)
+    print(json.dumps(loop_report, indent=2, sort_keys=True))
     return 0
 
 
