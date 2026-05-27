@@ -174,6 +174,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("data/agent-comparison-report.json"),
     )
 
+    benchmark_parser = subcommands.add_parser(
+        "benchmark-agents",
+        help="Benchmark several agent policies against a baseline on a format pack.",
+    )
+    benchmark_parser.add_argument("--pack", type=Path, required=True)
+    benchmark_parser.add_argument("--edopro-home", type=Path, required=True)
+    benchmark_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    benchmark_parser.add_argument(
+        "--policies",
+        default="random,heuristic,aggressive,tempo,control",
+        help="Comma-separated candidate policies to compare.",
+    )
+    benchmark_parser.add_argument("--baseline-policy", default="first-legal")
+    benchmark_parser.add_argument("--games-per-matchup", type=int, default=5)
+    benchmark_parser.add_argument("--max-decisions", type=int, default=None)
+    benchmark_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    benchmark_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/agent-benchmark-report.json"),
+    )
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -232,6 +258,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             edopro_home=args.edopro_home,
             gateway_script=args.gateway_script,
             candidate_policy=args.candidate_policy,
+            baseline_policy=args.baseline_policy,
+            games_per_matchup=args.games_per_matchup,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            output=args.output,
+        )
+    if args.command == "benchmark-agents":
+        return _benchmark_agents(
+            args.pack,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            policies=tuple(policy.strip() for policy in args.policies.split(",") if policy.strip()),
             baseline_policy=args.baseline_policy,
             games_per_matchup=args.games_per_matchup,
             max_decisions=args.max_decisions,
@@ -364,6 +402,8 @@ def _collect_edopro_training_report(
 
     wins_by_agent: dict[str, int] = {}
     tags: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    decision_samples: list[dict[str, object]] = []
     total_decisions = 0
     draws = 0
 
@@ -377,6 +417,24 @@ def _collect_edopro_training_report(
             create_agent(agent_b_policy, second_agent),
         )
         total_decisions += len(result.traces)
+        for trace in result.traces:
+            action_counts[trace.action.action_id] = action_counts.get(trace.action.action_id, 0) + 1
+            if len(decision_samples) < 25:
+                decision_samples.append(
+                    {
+                        "turn": trace.state.turn,
+                        "agent": trace.agent_name,
+                        "summary": trace.state.summary,
+                        "selected_action": trace.action.action_id,
+                        "selected_label": trace.action.label,
+                        "selected_tags": list(trace.action.tags),
+                        "selected_expected_value": trace.action.expected_value,
+                        "public_zones": {
+                            key: list(value) for key, value in trace.state.public_zones.items()
+                        },
+                        "evaluation": trace.note,
+                    }
+                )
         if result.winner is None:
             draws += 1
         else:
@@ -396,6 +454,8 @@ def _collect_edopro_training_report(
         "traced_decisions": total_decisions,
         "wins_by_agent": wins_by_agent,
         "tags": tags,
+        "action_counts": action_counts,
+        "decision_samples": decision_samples,
     }
 
 
@@ -536,6 +596,89 @@ def _compare_agents(
     timeout_seconds: float,
     output: Path,
 ) -> int:
+    report = _compare_agents_report(
+        pack_path,
+        edopro_home=edopro_home,
+        gateway_script=gateway_script,
+        candidate_policy=candidate_policy,
+        baseline_policy=baseline_policy,
+        games_per_matchup=games_per_matchup,
+        max_decisions=max_decisions,
+        timeout_seconds=timeout_seconds,
+    )
+    _write_report(output, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _benchmark_agents(
+    pack_path: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    policies: tuple[str, ...],
+    baseline_policy: str,
+    games_per_matchup: int,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    output: Path,
+) -> int:
+    comparisons = [
+        _compare_agents_report(
+            pack_path,
+            edopro_home=edopro_home,
+            gateway_script=gateway_script,
+            candidate_policy=policy,
+            baseline_policy=baseline_policy,
+            games_per_matchup=games_per_matchup,
+            max_decisions=max_decisions,
+            timeout_seconds=timeout_seconds,
+        )
+        for policy in policies
+    ]
+    ranked = sorted(
+        comparisons,
+        key=lambda report: (
+            float(report["candidate_decisive_win_rate"]),
+            float(report["candidate_win_rate"]),
+            -int(report["draws"]),
+        ),
+        reverse=True,
+    )
+    benchmark = {
+        "pack": str(pack_path),
+        "baseline_policy": baseline_policy,
+        "games_per_matchup": games_per_matchup,
+        "ranked_policies": [
+            {
+                "policy": report["candidate_policy"],
+                "candidate_win_rate": report["candidate_win_rate"],
+                "candidate_decisive_win_rate": report["candidate_decisive_win_rate"],
+                "candidate_wins": report["candidate_wins"],
+                "baseline_wins": report["baseline_wins"],
+                "draws": report["draws"],
+                "total_games": report["total_games"],
+            }
+            for report in ranked
+        ],
+        "comparisons": comparisons,
+    }
+    _write_report(output, benchmark)
+    print(json.dumps(benchmark, indent=2, sort_keys=True))
+    return 0
+
+
+def _compare_agents_report(
+    pack_path: Path,
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    candidate_policy: str,
+    baseline_policy: str,
+    games_per_matchup: int,
+    max_decisions: int | None,
+    timeout_seconds: float,
+) -> dict[str, object]:
     pack = load_format_pack(pack_path)
     run_max_decisions = max_decisions if max_decisions is not None else pack.max_decisions
     candidate_wins = 0
@@ -593,7 +736,7 @@ def _compare_agents(
             )
 
     decisive_games = candidate_wins + baseline_wins
-    report = {
+    return {
         "format": pack.name,
         "candidate_policy": candidate_policy,
         "baseline_policy": baseline_policy,
@@ -609,12 +752,11 @@ def _compare_agents(
         "candidate_decisive_win_rate": candidate_wins / decisive_games if decisive_games else 0.0,
         "matchups": matchups,
     }
-    report_json = json.dumps(report, indent=2, sort_keys=True)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(report_json + "\n", encoding="utf-8")
-    print(report_json)
-    return 0
 
+
+def _write_report(output: Path, report: dict[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 def _gateway_command_for_decks(
     gateway_script: Path,

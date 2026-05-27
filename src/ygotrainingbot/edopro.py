@@ -182,7 +182,18 @@ class JsonLineEdoproSimulator:
                         raise EdoproGatewayError(
                             f"Agent {agent.name!r} chose illegal action {action.action_id!r}."
                         )
-                    traces.append(DuelTrace(state=state, action=action, agent_name=agent.name))
+                    explanation = ""
+                    explain = getattr(agent, "explain_decision", None)
+                    if callable(explain):
+                        explanation = str(explain(state, action))
+                    traces.append(
+                        DuelTrace(
+                            state=state,
+                            action=action,
+                            agent_name=agent.name,
+                            note=explanation,
+                        )
+                    )
                     self._send(
                         process,
                         {

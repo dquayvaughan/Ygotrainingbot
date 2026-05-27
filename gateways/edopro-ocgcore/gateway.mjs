@@ -66,7 +66,7 @@ async function runDuel() {
       throw new Error(`Unknown ocgcore process result: ${status}`);
     }
 
-    const selectable = [...messages].reverse().find((message) => legalActionsFor(message).length > 0);
+    const selectable = [...messages].reverse().find((message) => legalActionsFor(message, lifePoints).length > 0);
     if (!selectable) {
       if (messages.some((message) => message.type === OcgMessageType.RETRY)) {
         if (retryQueue.length > 0) {
@@ -87,7 +87,7 @@ async function runDuel() {
     }
 
     decisions += 1;
-    const legalActions = legalActionsFor(selectable);
+    const legalActions = legalActionsFor(selectable, lifePoints);
     const stateId = `ocgcore-${decisions}`;
     emit({
       type: "state",
@@ -95,9 +95,9 @@ async function runDuel() {
         state_id: stateId,
         turn: decisions,
         active_player: playerName(selectable.player ?? 0),
-        summary: summarizeMessage(selectable),
+        summary: summarizeMessage(selectable, lifePoints),
         legal_actions: legalActions.map(({ response: _response, ...action }) => action),
-        public_zones: {},
+        public_zones: visibleZonesFor(selectable.player ?? 0, lifePoints),
       },
     });
 
@@ -137,12 +137,12 @@ function adjudicateByLifePoints(lifePoints) {
 }
 
 
-function legalActionsFor(message) {
+function legalActionsFor(message, lifePoints = [8000, 8000]) {
   switch (message.type) {
     case OcgMessageType.SELECT_IDLECMD:
-      return idleActions(message);
+      return idleActions(message, lifePoints);
     case OcgMessageType.SELECT_BATTLECMD:
-      return battleActions(message);
+      return battleActions(message, lifePoints);
     case OcgMessageType.SELECT_CHAIN:
       return chainActions(message);
     case OcgMessageType.SELECT_CARD:
@@ -192,7 +192,7 @@ function legalActionsFor(message) {
   }
 }
 
-function idleActions(message) {
+function idleActions(message, lifePoints) {
   const actions = [];
   // Put safe phase actions first for baseline agents. More ambitious agents can
   // still choose summons, sets, and activations from the full legal action list.
@@ -236,7 +236,7 @@ function idleActions(message) {
 }
 
 
-function battleActions(message) {
+function battleActions(message, lifePoints) {
   const actions = [];
   if (message.to_ep) {
     actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_EP, index: null } });
@@ -244,12 +244,27 @@ function battleActions(message) {
   if (message.to_m2) {
     actions.push({ action_id: "to-main-phase-2", label: "Go to Main Phase 2", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_M2, index: null } });
   }
-  message.attacks.forEach((card, index) => actions.push({
-    action_id: `attack-${index}`,
-    label: `Attack with ${cardName(card.code)}`,
-    tags: ["attack"],
-    response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_BATTLE, index },
-  }));
+  message.attacks.forEach((card, index) => {
+    const attack = Math.max(0, cardAttack(card.code));
+    const opponent = message.player === 0 ? 1 : 0;
+    const damage = card.can_direct ? attack : Math.floor(attack / 2);
+    const tags = ["attack", `opp-lp:${lifePoints[opponent]}`];
+    if (card.can_direct) {
+      tags.push("direct-attack", `damage:${damage}`, `lp-swing:${damage}`);
+    }
+    if (damage >= lifePoints[opponent]) {
+      tags.push("lethal");
+    }
+    actions.push({
+      action_id: `attack-${index}`,
+      label: card.can_direct
+        ? `Direct attack with ${cardName(card.code)} for ${damage}`
+        : `Attack with ${cardName(card.code)}`,
+      expected_value: damage / 100,
+      tags,
+      response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.SELECT_BATTLE, index },
+    });
+  });
   message.chains.forEach((card, index) => actions.push({
     action_id: `battle-chain-${index}`,
     label: `Activate ${cardName(card.code)}`,
@@ -314,16 +329,54 @@ function readScript(scriptName) {
   return readFileSync(scriptPath, "utf8");
 }
 
-function summarizeMessage(message) {
-  return `EDOPro ${ocgMessageTypeStrings.get(message.type) ?? message.type} decision`;
+function summarizeMessage(message, lifePoints = [8000, 8000]) {
+  return `EDOPro ${ocgMessageTypeStrings.get(message.type) ?? message.type} decision | LP ${playerName(0)}:${lifePoints[0]} ${playerName(1)}:${lifePoints[1]}`;
 }
 
 function cardName(code) {
   return database.name(code);
 }
 
+function cardAttack(code) {
+  return database.attack(code);
+}
+
 function playerName(playerIndex) {
   return players[playerIndex] ?? `player-${playerIndex}`;
+}
+
+function visibleZonesFor(activePlayer, lifePoints) {
+  const opponent = activePlayer === 0 ? 1 : 0;
+  return {
+    life_points: lifePoints.map((lp, index) => `${playerName(index)}:${lp}`),
+    known_to_agent: [
+      `active_player:${playerName(activePlayer)}`,
+      "legal_actions:actionable own/public choices only",
+      "opponent_card_identities:not_exposed",
+    ],
+    hidden_counts: [
+      `${playerName(activePlayer)}.hand:${queryCount(activePlayer, OcgLocation.HAND)}`,
+      `${playerName(opponent)}.hand:${queryCount(opponent, OcgLocation.HAND)}`,
+      `${playerName(activePlayer)}.deck:${queryCount(activePlayer, OcgLocation.DECK)}`,
+      `${playerName(opponent)}.deck:${queryCount(opponent, OcgLocation.DECK)}`,
+      `${playerName(activePlayer)}.extra:${queryCount(activePlayer, OcgLocation.EXTRA)}`,
+      `${playerName(opponent)}.extra:${queryCount(opponent, OcgLocation.EXTRA)}`,
+    ],
+    public_counts: [
+      `${playerName(activePlayer)}.grave:${queryCount(activePlayer, OcgLocation.GRAVE)}`,
+      `${playerName(opponent)}.grave:${queryCount(opponent, OcgLocation.GRAVE)}`,
+      `${playerName(activePlayer)}.banished:${queryCount(activePlayer, OcgLocation.REMOVED)}`,
+      `${playerName(opponent)}.banished:${queryCount(opponent, OcgLocation.REMOVED)}`,
+    ],
+  };
+}
+
+function queryCount(player, location) {
+  try {
+    return lib.duelQueryCount(handle, player, location);
+  } catch (_error) {
+    return 0;
+  }
 }
 
 function countTurns(messages) {
@@ -432,6 +485,10 @@ class CardDatabase {
       this.names.set(code, this.nameStatement.get(code)?.name ?? String(code));
     }
     return this.names.get(code);
+  }
+
+  attack(code) {
+    return this.dataStatement.get(code)?.atk ?? 0;
   }
 }
 

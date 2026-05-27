@@ -127,3 +127,20 @@ python3 -m ygotrainingbot.cli compare-agents \
   --max-decisions 200 \
   --output data/agent-comparison-report.json
 ```
+
+### Benchmark multiple policies
+
+Run benchmark agents against the first-legal baseline:
+
+```bash
+python3 -m ygotrainingbot.cli benchmark-agents \
+  --pack configs/format-packs/proof-normal-baseline.json \
+  --edopro-home /path/to/edopro-home \
+  --policies random,heuristic,aggressive,tempo,control \
+  --baseline-policy first-legal \
+  --games-per-matchup 10 \
+  --max-decisions 200 \
+  --output data/agent-benchmark-report.json
+```
+
+Decision samples include the selected action, heuristic score/explanation, top alternatives, public LP, and hidden-zone counts. Opponent card identities are not exposed to the policy.
