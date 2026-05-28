@@ -36,6 +36,25 @@ The trainer runs every deck into every other deck, including mirrors. The report
 contains per-matchup stats plus aggregate tags for actions like normal summon,
 attack, chain, zone selection, and phase movement.
 
+## Train across formats (curriculum)
+
+Use sequential format training to carry policy growth from one era to the next.
+Each stage trains on one format pack, learns updated weights, then promotes only
+if the candidate policy beats the previous policy on that same format.
+
+```bash
+python3 -m ygotrainingbot.cli train-format-curriculum \
+  --packs configs/format-packs/goat-2005.json configs/format-packs/edison-2010.json \
+  --edopro-home /tmp/ygotrain/edopro-home \
+  --games-per-matchup 8 \
+  --promotion-games-per-matchup 12 \
+  --output-dir data/format-curriculum \
+  --promote-to data/promoted-policy.json
+```
+
+This writes stage artifacts under `data/format-curriculum/` and a final
+`curriculum-report.json` with promotion results for each format.
+
 ## Adding more topping deck lists
 
 Add another deck object to a format pack:

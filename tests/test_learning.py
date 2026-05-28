@@ -61,7 +61,9 @@ def test_learn_from_report_writes_policy_and_plain_english(tmp_path: Path) -> No
     policy = json.loads(policy_path.read_text())
     assert "Yu-Gi-Oh bot learning report" in english
     assert "Likely mistakes" in english
+    assert "Why the best line was better" in english
     assert "normal-summon-0" in english
+    assert "score edge" in english
     assert policy["observations"] == 2
     assert policy["tag_weights"]["phase"] < 0
     assert policy["tag_weights"]["attack"] > 0

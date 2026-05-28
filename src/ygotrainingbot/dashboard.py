@@ -100,7 +100,7 @@ class DashboardState:
         job_dir.mkdir(parents=True, exist_ok=False)
         job = TrainingJob(
             job_id=job_id,
-            pack=str(resolved_pack.relative_to(self.settings.repo_root)),
+            pack=self._display_path(resolved_pack),
             status="queued",
             games_per_matchup=games_per_matchup,
             max_decisions=max_decisions,
@@ -261,9 +261,10 @@ class DashboardState:
 
     def _display_path(self, path: Path) -> str:
         try:
-            return str(path.relative_to(self.settings.repo_root))
+            display = str(path.relative_to(self.settings.repo_root))
         except ValueError:
-            return str(path)
+            display = str(path)
+        return display.replace("\\", "/")
 
     def _read_job_meta(self, path: Path) -> dict[str, object]:
         return json.loads(path.read_text(encoding="utf-8"))

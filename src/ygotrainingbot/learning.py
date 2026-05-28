@@ -89,6 +89,7 @@ def analyze_report(report: dict[str, Any]) -> dict[str, Any]:
 
     best_plays = _best_play_samples(samples)
     mistakes = _mistake_samples(samples)
+    best_line_depth = _why_best_line_samples(samples)
     tag_lessons = _tag_lessons(tags, total_decisions)
     bottlenecks = _bottlenecks(tags, actions, draws, total_games)
 
@@ -102,6 +103,7 @@ def analyze_report(report: dict[str, Any]) -> dict[str, Any]:
         "top_actions": actions.most_common(20),
         "best_plays": best_plays,
         "mistakes": mistakes,
+        "best_line_depth": best_line_depth,
         "tag_lessons": tag_lessons,
         "bottlenecks": bottlenecks,
     }
@@ -143,6 +145,12 @@ def render_english_report(analysis: dict[str, Any], learned: LearnedPolicy) -> s
         lines.append(f"- {bottleneck}")
     if not analysis["mistakes"] and not analysis["bottlenecks"]:
         lines.append("- No obvious repeated mistake pattern was detected in this report.")
+
+    lines.extend(["", "Why the best line was better:"])
+    for insight in analysis["best_line_depth"][:10]:
+        lines.append(f"- {insight}")
+    if not analysis["best_line_depth"]:
+        lines.append("- Not enough scored alternatives were logged to explain best-line depth yet.")
 
     lines.extend(["", "Policy updates saved:"])
     if learned.tag_weights:
@@ -205,10 +213,16 @@ def _mistake_samples(samples: list[dict[str, Any]]) -> list[str]:
         if alternatives and alternatives[0].get("action_id") != selected:
             gap = float(alternatives[0].get("score", 0)) - _selected_score(sample.get("evaluation", ""))
             if gap > 20:
+                best_tags = _format_tags(alternatives[0].get("tags", []))
+                selected_tags = _format_tags(tags)
                 mistakes.append(
                     (
                         gap,
-                        f"On turn {sample.get('turn')}, {sample.get('agent')} chose `{selected}` but `{alternatives[0].get('action_id')}` scored about {gap:.1f} higher.",
+                        (
+                            f"On turn {sample.get('turn')}, {sample.get('agent')} chose `{selected}` "
+                            f"({selected_tags}) but `{alternatives[0].get('action_id')}` scored about {gap:.1f} "
+                            f"higher with {best_tags}."
+                        ),
                     )
                 )
         if "phase" in tags and "to-end-phase" in selected:
@@ -226,6 +240,51 @@ def _mistake_samples(samples: list[dict[str, Any]]) -> list[str]:
                 )
             )
     return [sentence for _score, sentence in sorted(mistakes, reverse=True)[:12]]
+
+
+def _why_best_line_samples(samples: list[dict[str, Any]]) -> list[str]:
+    insights: list[tuple[float, str]] = []
+    for sample in samples:
+        alternatives = _top_alternatives(sample.get("evaluation", ""))
+        if not alternatives:
+            continue
+        selected_action = str(sample.get("selected_action", ""))
+        selected_score = _selected_score(sample.get("evaluation", ""))
+        selected_ev = _float_or_none(sample.get("selected_expected_value"))
+        best = alternatives[0]
+        if str(best.get("action_id", "")) == selected_action:
+            if len(alternatives) < 2:
+                continue
+            runner_up = alternatives[1]
+            gap = float(best.get("score", 0.0)) - float(runner_up.get("score", 0.0))
+            if gap <= 10:
+                continue
+            sentence = (
+                f"Turn {sample.get('turn')} ({sample.get('summary')}): `{best.get('action_id')}` was best "
+                f"because it outscored `{runner_up.get('action_id')}` by {gap:.1f}. "
+                f"Winning tags: {_format_tags(best.get('tags', []))}; runner-up tags: {_format_tags(runner_up.get('tags', []))}."
+            )
+            insights.append((gap, sentence))
+            continue
+
+        best_score = float(best.get("score", 0.0))
+        gap = best_score - selected_score
+        if gap <= 12:
+            continue
+        best_tags = _format_tags(best.get("tags", []))
+        selected_tags = _format_tags(sample.get("selected_tags", []))
+        reasons = [f"score edge {gap:.1f}"]
+        best_ev = _extract_expected_value(best)
+        if best_ev is not None and selected_ev is not None:
+            ev_gap = best_ev - selected_ev
+            if abs(ev_gap) >= 0.1:
+                reasons.append(f"expected value edge {ev_gap:+.1f}")
+        sentence = (
+            f"Turn {sample.get('turn')} ({sample.get('summary')}): best line was `{best.get('action_id')}` over "
+            f"`{selected_action}` due to {', '.join(reasons)}. Best tags: {best_tags}; chosen tags: {selected_tags}."
+        )
+        insights.append((gap, sentence))
+    return [sentence for _score, sentence in sorted(insights, reverse=True)[:12]]
 
 
 def _tag_lessons(tags: Counter[str], total_decisions: int) -> list[str]:
@@ -313,6 +372,28 @@ def _top_alternatives(evaluation: object) -> list[dict[str, Any]]:
     except (SyntaxError, ValueError):
         return []
     return value if isinstance(value, list) else []
+
+
+def _extract_expected_value(action_entry: dict[str, Any]) -> float | None:
+    label = str(action_entry.get("label", ""))
+    match = re.search(r"EV=([-0-9.]+)", label)
+    return float(match.group(1)) if match else None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_tags(tags: Iterable[object]) -> str:
+    normalized = [str(tag) for tag in tags if str(tag)]
+    if not normalized:
+        return "no key tags"
+    return ", ".join(normalized[:4])
 
 
 def _int(value: object) -> int:

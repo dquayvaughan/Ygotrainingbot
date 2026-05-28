@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -269,6 +271,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop_parser.add_argument("--timeout-seconds", type=float, default=30.0)
     loop_parser.add_argument("--output-dir", type=Path, default=Path("data/learning-loop"))
 
+    curriculum_parser = subcommands.add_parser(
+        "train-format-curriculum",
+        help="Train across multiple formats in sequence, carrying forward learned policy.",
+    )
+    curriculum_parser.add_argument("--packs", type=Path, nargs="+", required=True)
+    curriculum_parser.add_argument("--edopro-home", type=Path, required=True)
+    curriculum_parser.add_argument(
+        "--gateway-script",
+        type=Path,
+        default=Path("gateways/edopro-ocgcore/gateway.mjs"),
+    )
+    curriculum_parser.add_argument("--policy", default="heuristic")
+    curriculum_parser.add_argument("--current-policy", type=Path, default=Path("data/promoted-policy.json"))
+    curriculum_parser.add_argument("--games-per-matchup", type=int, default=5)
+    curriculum_parser.add_argument("--promotion-games-per-matchup", type=int, default=None)
+    curriculum_parser.add_argument("--max-decisions", type=int, default=None)
+    curriculum_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    curriculum_parser.add_argument("--promote-to", type=Path, default=None)
+    curriculum_parser.add_argument("--output-dir", type=Path, default=Path("data/format-curriculum"))
+
     args = parser.parse_args(argv)
     if args.command == "fetch-cards":
         return _fetch_cards(args.cache)
@@ -379,6 +401,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             promotion_games_per_matchup=args.promotion_games_per_matchup,
             max_decisions=args.max_decisions,
             timeout_seconds=args.timeout_seconds,
+            output_dir=args.output_dir,
+        )
+    if args.command == "train-format-curriculum":
+        return _train_format_curriculum(
+            args.packs,
+            edopro_home=args.edopro_home,
+            gateway_script=args.gateway_script,
+            policy=args.policy,
+            current_policy=args.current_policy,
+            games_per_matchup=args.games_per_matchup,
+            promotion_games_per_matchup=args.promotion_games_per_matchup,
+            max_decisions=args.max_decisions,
+            timeout_seconds=args.timeout_seconds,
+            promote_to=args.promote_to,
             output_dir=args.output_dir,
         )
     raise ValueError(f"Unknown command {args.command!r}.")
@@ -510,6 +546,126 @@ def _train_learn_promote(
     return 0
 
 
+def _train_format_curriculum(
+    packs: Sequence[Path],
+    *,
+    edopro_home: Path,
+    gateway_script: Path,
+    policy: str,
+    current_policy: Path,
+    games_per_matchup: int,
+    promotion_games_per_matchup: int | None,
+    max_decisions: int | None,
+    timeout_seconds: float,
+    promote_to: Path | None,
+    output_dir: Path,
+) -> int:
+    if not packs:
+        raise ValueError("packs must include at least one format pack path.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    active_policy = current_policy if current_policy.exists() else None
+    stage_reports: list[dict[str, object]] = []
+
+    for index, pack in enumerate(packs, start=1):
+        stage_name = f"{index:02d}-{pack.stem}"
+        stage_dir = output_dir / stage_name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        stage_input_policy = active_policy
+        training_report = stage_dir / "format-training-report.json"
+        learning_summary = stage_dir / "learning-summary.txt"
+        candidate_policy = stage_dir / "candidate-policy.json"
+        promotion_report = stage_dir / "promotion-report.json"
+        promoted_policy = stage_dir / "promoted-policy.json"
+
+        _train_format_pack(
+            pack,
+            edopro_home=edopro_home,
+            gateway_script=gateway_script,
+            games_per_matchup=games_per_matchup,
+            max_decisions=max_decisions,
+            timeout_seconds=timeout_seconds,
+            output=training_report,
+            agent_a_policy=policy,
+            agent_b_policy=policy,
+            agent_a_weights=active_policy,
+            agent_b_weights=active_policy,
+        )
+        _learn_from_report(training_report, policy=candidate_policy, summary=learning_summary)
+
+        if active_policy is None:
+            shutil.copyfile(candidate_policy, promoted_policy)
+            promotion_payload: dict[str, object] = {
+                "promotable": True,
+                "reason": "No existing policy was available, so this candidate becomes the baseline.",
+                "comparison": None,
+            }
+            active_policy = promoted_policy
+        else:
+            comparison = _compare_agents_report(
+                pack,
+                edopro_home=edopro_home,
+                gateway_script=gateway_script,
+                candidate_policy=policy,
+                baseline_policy=policy,
+                candidate_weights=candidate_policy,
+                baseline_weights=active_policy,
+                games_per_matchup=promotion_games_per_matchup or games_per_matchup,
+                max_decisions=max_decisions,
+                timeout_seconds=timeout_seconds,
+            )
+            candidate_wins = int(comparison["candidate_wins"])
+            baseline_wins = int(comparison["baseline_wins"])
+            candidate_rate = float(comparison["candidate_win_rate"])
+            baseline_rate = float(comparison["baseline_win_rate"])
+            promotable = candidate_wins > baseline_wins and candidate_rate >= baseline_rate
+            if promotable:
+                shutil.copyfile(candidate_policy, promoted_policy)
+                active_policy = promoted_policy
+            promotion_payload = {
+                "promotable": promotable,
+                "reason": (
+                    "Candidate policy outperformed current policy and was promoted."
+                    if promotable
+                    else "Candidate policy did not outperform current policy; retained current policy."
+                ),
+                "comparison": comparison,
+            }
+
+        _write_report(promotion_report, promotion_payload)
+        stage_reports.append(
+            {
+                "stage": stage_name,
+                "pack": str(pack),
+                "starting_policy": str(current_policy) if index == 1 and current_policy.exists() else None,
+                "used_policy": str(stage_input_policy) if stage_input_policy else None,
+                "active_policy_after_stage": str(active_policy) if active_policy else None,
+                "candidate_policy": str(candidate_policy),
+                "promoted_policy": str(promoted_policy) if promoted_policy.exists() else None,
+                "training_report": str(training_report),
+                "learning_summary": str(learning_summary),
+                "promotion_report": str(promotion_report),
+                "promotable": bool(promotion_payload["promotable"]),
+            }
+        )
+
+    final_policy_path = active_policy
+    if final_policy_path is not None and promote_to is not None:
+        promote_to.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(final_policy_path, promote_to)
+        final_policy_path = promote_to
+
+    curriculum_report = {
+        "policy": policy,
+        "packs": [str(pack) for pack in packs],
+        "stages": stage_reports,
+        "final_policy": str(final_policy_path) if final_policy_path else None,
+    }
+    _write_report(output_dir / "curriculum-report.json", curriculum_report)
+    print(json.dumps(curriculum_report, indent=2, sort_keys=True))
+    return 0
+
+
 def _fetch_cards(cache_path: Path) -> int:
     cards = fetch_ygoprodeck_cards()
     save_card_database(cache_path, cards)
@@ -564,7 +720,7 @@ def _edopro_play_once(
     timeout_seconds: float,
 ) -> int:
     config = EdoproGatewayConfig.from_shell_words(
-        shlex.split(gateway_command),
+        shlex.split(gateway_command, posix=os.name != "nt"),
         timeout_seconds=timeout_seconds,
     )
     result = JsonLineEdoproSimulator(config).play(
@@ -649,7 +805,7 @@ def _collect_edopro_training_report(
 
     for _ in range(games):
         config = EdoproGatewayConfig.from_shell_words(
-            shlex.split(gateway_command),
+            shlex.split(gateway_command, posix=os.name != "nt"),
             timeout_seconds=timeout_seconds,
         )
         result = JsonLineEdoproSimulator(config).play(
