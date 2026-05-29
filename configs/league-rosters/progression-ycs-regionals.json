@@ -1,0 +1,220 @@
+{
+  "bots": [
+    {
+      "bot_id": "bot-01",
+      "name": "Yugi",
+      "policy": "search-control",
+      "characteristics": "tier-2-3 underdog control",
+      "initial_weights": {
+        "attack": 0.6,
+        "negate": 1.2,
+        "phase": -0.3,
+        "set-spell": 1.0
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Chaos Warrior representative top shell",
+          "archetype": "Chaos Warrior"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Frog Monarch representative top shell",
+          "archetype": "Frog Monarch"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-02",
+      "name": "Joey",
+      "policy": "tempo",
+      "characteristics": "tier-2-3 underdog tempo",
+      "initial_weights": {
+        "normal-summon": 1.1,
+        "phase": -0.3,
+        "set-spell": 0.3,
+        "special-summon": 1.0
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Chaos Warrior representative top shell",
+          "archetype": "Chaos Warrior"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Frog Monarch representative top shell",
+          "archetype": "Frog Monarch"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-03",
+      "name": "Kaiba",
+      "policy": "aggressive",
+      "characteristics": "tier-2-3 underdog pressure",
+      "initial_weights": {
+        "attack": 1.4,
+        "decline": -0.6,
+        "direct-attack": 1.2,
+        "phase": -0.4
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Chaos Warrior representative top shell",
+          "archetype": "Chaos Warrior"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Frog Monarch representative top shell",
+          "archetype": "Frog Monarch"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-04",
+      "name": "Pegasus",
+      "policy": "control",
+      "characteristics": "tier-1 meta control",
+      "initial_weights": {
+        "negate": 1.8,
+        "phase": -0.2,
+        "removal": 1.4,
+        "set-spell": 0.9
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-05",
+      "name": "Mai",
+      "policy": "tempo",
+      "characteristics": "tier-1 meta tempo",
+      "initial_weights": {
+        "attack": 1.1,
+        "normal-summon": 1.6,
+        "phase": -0.4,
+        "special-summon": 1.4
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-06",
+      "name": "Bakura",
+      "policy": "aggressive",
+      "characteristics": "tier-1 meta pressure",
+      "initial_weights": {
+        "attack": 2.0,
+        "direct-attack": 1.6,
+        "normal-summon": 1.2,
+        "phase": -0.5
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-07",
+      "name": "Keith",
+      "policy": "control",
+      "characteristics": "tier-1 grind control",
+      "initial_weights": {
+        "decline": -0.4,
+        "draw": 1.0,
+        "negate": 1.5,
+        "protect": 1.3
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-08",
+      "name": "Rex",
+      "policy": "heuristic",
+      "characteristics": "tier-1 balanced midrange",
+      "initial_weights": {
+        "attack": 1.2,
+        "normal-summon": 1.0,
+        "phase": -0.4,
+        "removal": 1.0
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    },
+    {
+      "bot_id": "bot-09",
+      "name": "Mako",
+      "policy": "tempo",
+      "characteristics": "tier-1 interaction tempo",
+      "initial_weights": {
+        "attack": 1.0,
+        "chain": 0.9,
+        "decline": -0.5,
+        "special-summon": 1.2
+      },
+      "assigned_decks": {
+        "configs/format-packs/goat-2005.json": {
+          "pack": "configs/format-packs/goat-2005.json",
+          "name": "Goat Control representative top shell",
+          "archetype": "Goat Control"
+        },
+        "configs/format-packs/edison-2010.json": {
+          "pack": "configs/format-packs/edison-2010.json",
+          "name": "Quickdraw Dandywarrior representative top shell",
+          "archetype": "Quickdraw Dandywarrior"
+        }
+      }
+    }
+  ]
+}

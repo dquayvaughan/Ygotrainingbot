@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ygotrainingbot.duel_logs import load_decision_samples_for_learning
+
 
 IMPORTANT_TAGS = {
     "attack",
@@ -40,34 +42,33 @@ class LearnedPolicy:
     observations: int
 
 
-def learn_from_report(report_path: Path, policy_path: Path | None = None) -> tuple[dict[str, Any], str]:
+def learn_from_report(
+    report_path: Path,
+    policy_path: Path | None = None,
+    *,
+    update_scale: float = 1.0,
+) -> tuple[dict[str, Any], str]:
     """Read a training report, update policy weights, and return English feedback."""
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     previous = _load_policy(policy_path) if policy_path else LearnedPolicy(tag_weights={}, observations=0)
-    analysis = analyze_report(report)
-    learned = _update_policy(previous, analysis)
+    analysis = analyze_report(report, report_path=report_path)
+    learned = _update_policy(previous, analysis, update_scale=update_scale)
     if policy_path is not None:
+        from ygotrainingbot.policy_runtime import learned_weight_scale, write_policy_file
+
         policy_path.parent.mkdir(parents=True, exist_ok=True)
-        policy_path.write_text(
-            json.dumps(
-                {
-                    "tag_weights": learned.tag_weights,
-                    "observations": learned.observations,
-                    "version": _next_version(previous),
-                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "parent_observations": previous.observations,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_policy_file(
+            policy_path,
+            learned.tag_weights,
+            observations=learned.observations,
+            learned_weight_scale_value=learned_weight_scale(policy_path),
+            parent_observations=previous.observations,
         )
     return analysis, render_english_report(analysis, learned)
 
 
-def analyze_report(report: dict[str, Any]) -> dict[str, Any]:
+def analyze_report(report: dict[str, Any], *, report_path: Path | None = None) -> dict[str, Any]:
     """Extract performance, mistake, and best-play signals from a report."""
 
     reports = list(_iter_leaf_reports(report))
@@ -79,16 +80,26 @@ def analyze_report(report: dict[str, Any]) -> dict[str, Any]:
     wins = Counter()
     tags = Counter()
     actions = Counter()
-    samples: list[dict[str, Any]] = []
+    samples = load_decision_samples_for_learning(report, report_path=report_path)
+    if not samples:
+        for item in reports:
+            samples.extend(
+                dict(sample)
+                for sample in item.get("decision_samples", [])
+                if isinstance(sample, dict)
+            )
 
     for item in reports:
         wins.update({str(k): _int(v) for k, v in dict(item.get("wins_by_agent", {})).items()})
         tags.update({str(k): _int(v) for k, v in dict(item.get("tags", {})).items()})
         actions.update({str(k): _int(v) for k, v in dict(item.get("action_counts", {})).items()})
-        samples.extend(dict(sample) for sample in item.get("decision_samples", []) if isinstance(sample, dict))
+    if samples and total_decisions <= 0:
+        total_decisions = len(samples)
 
     best_plays = _best_play_samples(samples)
     mistakes = _mistake_samples(samples)
+    mistake_adjustments = _mistake_weight_adjustments(samples)
+    outcome_adjustments = _outcome_weight_adjustments(samples)
     best_line_depth = _why_best_line_samples(samples)
     tag_lessons = _tag_lessons(tags, total_decisions)
     bottlenecks = _bottlenecks(tags, actions, draws, total_games)
@@ -103,6 +114,8 @@ def analyze_report(report: dict[str, Any]) -> dict[str, Any]:
         "top_actions": actions.most_common(20),
         "best_plays": best_plays,
         "mistakes": mistakes,
+        "mistake_adjustments": dict(mistake_adjustments),
+        "outcome_adjustments": dict(outcome_adjustments),
         "best_line_depth": best_line_depth,
         "tag_lessons": tag_lessons,
         "bottlenecks": bottlenecks,
@@ -242,6 +255,27 @@ def _mistake_samples(samples: list[dict[str, Any]]) -> list[str]:
     return [sentence for _score, sentence in sorted(mistakes, reverse=True)[:12]]
 
 
+def _mistake_weight_adjustments(samples: list[dict[str, Any]]) -> Counter[str]:
+    """Turn high-confidence mistake traces into tag weight nudges."""
+
+    adjustments: Counter[str] = Counter()
+    for sample in samples:
+        selected = str(sample.get("selected_action", ""))
+        alternatives = _top_alternatives(sample.get("evaluation", ""))
+        if not alternatives or alternatives[0].get("action_id") == selected:
+            continue
+        gap = float(alternatives[0].get("score", 0)) - _selected_score(sample.get("evaluation", ""))
+        if gap <= 20:
+            continue
+        boost = min(2.5, gap / 16.0)
+        penalty = min(1.25, gap / 32.0)
+        for tag in alternatives[0].get("tags", []):
+            adjustments[str(tag)] += boost
+        for tag in sample.get("selected_tags", ()):
+            adjustments[str(tag)] -= penalty
+    return adjustments
+
+
 def _why_best_line_samples(samples: list[dict[str, Any]]) -> list[str]:
     insights: list[tuple[float, str]] = []
     for sample in samples:
@@ -315,24 +349,88 @@ def _bottlenecks(tags: Counter[str], actions: Counter[str], draws: int, total_ga
     return bottlenecks
 
 
-def _update_policy(previous: LearnedPolicy, analysis: dict[str, Any]) -> LearnedPolicy:
+def _outcome_weight_adjustments(samples: list[dict[str, Any]]) -> Counter[str]:
+    """Boost tags that correlate with wins; penalize tags that correlate with losses."""
+
+    win_tags: Counter[str] = Counter()
+    loss_tags: Counter[str] = Counter()
+    second_win_tags: Counter[str] = Counter()
+    second_loss_tags: Counter[str] = Counter()
+
+    for sample in samples:
+        won = sample.get("game_won")
+        if won is None:
+            continue
+        tags = [str(tag) for tag in sample.get("selected_tags", ())]
+        goes_first = sample.get("bot_goes_first")
+        if won:
+            win_tags.update(tags)
+            if goes_first is False:
+                second_win_tags.update(tags)
+        else:
+            loss_tags.update(tags)
+            if goes_first is False:
+                second_loss_tags.update(tags)
+
+    adjustments: Counter[str] = Counter()
+    for tag in set(win_tags) | set(loss_tags):
+        wins = win_tags.get(tag, 0)
+        losses = loss_tags.get(tag, 0)
+        total = wins + losses
+        if total < 3:
+            continue
+        win_share = wins / total
+        if win_share >= 0.55:
+            adjustments[tag] += min(2.0, (win_share - 0.5) * 5.0)
+        elif win_share <= 0.45:
+            adjustments[tag] -= min(1.5, (0.5 - win_share) * 4.0)
+
+    for tag in set(second_win_tags) | set(second_loss_tags):
+        wins = second_win_tags.get(tag, 0)
+        losses = second_loss_tags.get(tag, 0)
+        total = wins + losses
+        if total < 2:
+            continue
+        win_share = wins / total
+        if win_share >= 0.55:
+            adjustments[tag] += min(1.5, (win_share - 0.5) * 4.0)
+        elif win_share <= 0.45:
+            adjustments[tag] -= min(1.0, (0.5 - win_share) * 3.0)
+
+    return adjustments
+
+
+def _update_policy(
+    previous: LearnedPolicy,
+    analysis: dict[str, Any],
+    *,
+    update_scale: float = 1.0,
+) -> LearnedPolicy:
     weights = defaultdict(float, previous.tag_weights)
     total_games = max(1, int(analysis["total_games"]))
     draw_rate = int(analysis["draws"]) / total_games
     top_tags = Counter({str(tag): int(count) for tag, count in analysis["top_tags"]})
+    scale = max(0.0, float(update_scale))
 
     for tag in ("attack", "direct-attack", "lethal", "removal", "destroy-monster", "battle-trap", "negate"):
         if top_tags.get(tag):
-            weights[tag] += min(2.0, top_tags[tag] / max(1, int(analysis["total_decisions"])) * 10)
+            weights[tag] += scale * min(5.0, top_tags[tag] / max(1, int(analysis["total_decisions"])) * 25)
     if draw_rate > 0.5:
-        weights["phase"] -= 0.5
-        weights["decline"] -= 0.5
-        weights["attack"] += 0.5
-        weights["direct-attack"] += 0.5
+        weights["phase"] -= scale * 1.0
+        weights["decline"] -= scale * 1.0
+        weights["attack"] += scale * 1.0
+        weights["direct-attack"] += scale * 1.0
     if top_tags.get("decline", 0) > top_tags.get("chain", 0) * 0.8 and top_tags.get("chain", 0):
-        weights["decline"] -= 0.25
-        weights["removal"] += 0.25
-        weights["negate"] += 0.25
+        weights["decline"] -= scale * 0.75
+        weights["removal"] += scale * 0.75
+        weights["negate"] += scale * 0.75
+
+    for source in ("mistake_adjustments", "outcome_adjustments"):
+        tag_adjustments = analysis.get(source, {})
+        if isinstance(tag_adjustments, dict):
+            for tag, delta in tag_adjustments.items():
+                weights[str(tag)] += scale * float(delta)
+
     return LearnedPolicy(tag_weights=dict(sorted(weights.items())), observations=previous.observations + int(analysis["total_decisions"]))
 
 

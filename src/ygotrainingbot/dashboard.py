@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +18,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ygotrainingbot.format_training import load_format_pack
+from ygotrainingbot.human_duels import (
+    DEFAULT_CATALOG_DIR,
+    build_learning_report,
+    catalog_summary,
+    import_human_duel_files,
+    write_learning_report,
+)
 from ygotrainingbot.learning import learn_from_report
 
 
@@ -28,6 +36,7 @@ class DashboardSettings:
     jobs_dir: Path
     edopro_home: Path
     gateway_script: Path
+    human_catalog_dir: Path = DEFAULT_CATALOG_DIR
     python_executable: str = sys.executable
 
 
@@ -138,6 +147,78 @@ class DashboardState:
         if not summary_path.exists():
             return "Learning summary is not ready yet."
         return summary_path.read_text(encoding="utf-8", errors="replace")
+
+    def human_catalog(self) -> dict[str, Any]:
+        catalog_dir = self._human_catalog_dir()
+        return catalog_summary(catalog_dir)
+
+    def upload_human_replays(self, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+        if not files:
+            raise ValueError("upload at least one .json replay file.")
+
+        result = import_human_duel_files(files, catalog_dir=self._human_catalog_dir())
+        return {
+            "imported": len(result.imported),
+            "skipped": result.skipped,
+            "errors": result.errors,
+            "duels": [
+                {
+                    "duel_id": entry.duel_id,
+                    "format": entry.format,
+                    "study_agent": entry.study_agent,
+                    "decision_count": entry.decision_count,
+                }
+                for entry in result.imported
+            ],
+            "catalog": self.human_catalog(),
+        }
+
+    def learn_from_human_replays(
+        self,
+        *,
+        study_agent: str | None = None,
+        format_filter: str | None = None,
+    ) -> dict[str, Any]:
+        catalog_dir = self._human_catalog_dir()
+        report = build_learning_report(
+            catalog_dir,
+            study_agent=study_agent or None,
+            format_filter=format_filter or None,
+        )
+        report_path = write_learning_report(catalog_dir, report)
+        summary_path = catalog_dir / "learning-summary.txt"
+        policy_path = self._global_policy_path()
+        _analysis, english = learn_from_report(report_path, policy_path)
+        summary_path.write_text(english, encoding="utf-8")
+        return {
+            "report_path": self._display_path(report_path),
+            "summary_path": self._display_path(summary_path),
+            "policy_path": self._display_path(policy_path),
+            "total_games": report.get("total_games"),
+            "total_decisions": report.get("total_traced_decisions"),
+            "format": report.get("format"),
+            "bot_agent": report.get("bot_agent"),
+            "summary": english,
+        }
+
+    def human_learning_summary(self) -> str:
+        summary_path = self._human_catalog_dir() / "learning-summary.txt"
+        if not summary_path.is_file():
+            return "No human replay learning summary yet. Upload replays and click Learn."
+        return summary_path.read_text(encoding="utf-8", errors="replace")
+
+    def human_learning_report(self) -> dict[str, Any]:
+        report_path = self._human_catalog_dir() / "human-learning-report.json"
+        if not report_path.is_file():
+            raise KeyError("human-learning-report.json")
+        return json.loads(report_path.read_text(encoding="utf-8"))
+
+    def _human_catalog_dir(self) -> Path:
+        path = self.settings.human_catalog_dir
+        if not path.is_absolute():
+            path = (self.settings.repo_root / path).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _run_job(self, job: TrainingJob) -> None:
         job_dir = self._job_dir(job.job_id)
@@ -301,8 +382,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             self._send_html(DASHBOARD_HTML)
+        elif path == "/replays":
+            self._send_html(REPLAYS_HTML)
         elif path == "/api/format-packs":
             self._send_json({"format_packs": self.state.format_packs()})
+        elif path == "/api/human-duels":
+            self._send_json(self.state.human_catalog())
+        elif path == "/api/human-duels/summary":
+            self._send_text(self.state.human_learning_summary())
+        elif path == "/api/human-duels/report":
+            self._send_json(self.state.human_learning_report())
         elif path == "/api/jobs":
             self._send_json({"jobs": self.state.jobs()})
         elif path.startswith("/api/jobs/") and path.endswith("/log"):
@@ -322,16 +411,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_post(self) -> None:
         path = urlparse(self.path).path
-        if path != "/api/jobs":
-            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+        if path == "/api/jobs":
+            payload = self._read_json()
+            job = self.state.start_job(
+                pack_path=str(payload.get("pack", "")),
+                games_per_matchup=int(payload.get("games_per_matchup", 5)),
+                max_decisions=int(payload.get("max_decisions", 60)),
+            )
+            self._send_json({"job": asdict(job)}, status=HTTPStatus.CREATED)
             return
-        payload = self._read_json()
-        job = self.state.start_job(
-            pack_path=str(payload.get("pack", "")),
-            games_per_matchup=int(payload.get("games_per_matchup", 5)),
-            max_decisions=int(payload.get("max_decisions", 60)),
-        )
-        self._send_json({"job": asdict(job)}, status=HTTPStatus.CREATED)
+        if path == "/api/human-duels/upload":
+            files = self._read_upload_files()
+            payload = self.state.upload_human_replays(files)
+            status = HTTPStatus.CREATED if payload["imported"] else HTTPStatus.BAD_REQUEST
+            self._send_json(payload, status=status)
+            return
+        if path == "/api/human-duels/learn":
+            payload = self._read_json()
+            study_agent = payload.get("study_agent")
+            format_filter = payload.get("format")
+            result = self.state.learn_from_human_replays(
+                study_agent=str(study_agent) if study_agent else None,
+                format_filter=str(format_filter) if format_filter else None,
+            )
+            self._send_json(result)
+            return
+        self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def _read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -340,6 +445,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("request body must be a JSON object.")
         return payload
+
+    def _read_upload_files(self) -> list[tuple[str, bytes]]:
+        content_type = self.headers.get("Content-Type", "")
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        if not content_type.startswith("multipart/form-data"):
+            raise ValueError("upload requests must use multipart/form-data.")
+        return _parse_multipart_files(body, content_type)
 
     def _send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
@@ -366,12 +479,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _parse_multipart_files(body: bytes, content_type: str) -> list[tuple[str, bytes]]:
+    """Parse uploaded files from a multipart/form-data body."""
+
+    match = re.search(r"boundary=(.+)", content_type, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError("multipart request missing boundary.")
+    boundary = match.group(1).strip().strip('"').encode("utf-8")
+    delimiter = b"--" + boundary
+    files: list[tuple[str, bytes]] = []
+
+    for part in body.split(delimiter):
+        if not part or part in (b"--", b"--\r\n"):
+            continue
+        chunk = part
+        if chunk.startswith(b"\r\n"):
+            chunk = chunk[2:]
+        if chunk.endswith(b"\r\n"):
+            chunk = chunk[:-2]
+        if not chunk.strip():
+            continue
+
+        header_blob, _, data = chunk.partition(b"\r\n\r\n")
+        if not header_blob:
+            continue
+        headers = header_blob.decode("utf-8", errors="replace")
+        if "filename=" not in headers:
+            continue
+
+        filename_match = re.search(r'filename="([^"]*)"', headers)
+        if not filename_match:
+            filename_match = re.search(r"filename=([^;\r\n]+)", headers)
+        filename = (filename_match.group(1) if filename_match else "upload.json").strip()
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        if not filename.lower().endswith(".json"):
+            raise ValueError(f"only .json replay files are supported (got {filename!r}).")
+        files.append((filename, data))
+
+    return files
+
+
 def run_dashboard(
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
     repo_root: Path | None = None,
     edopro_home: Path | None = None,
+    human_catalog_dir: Path | None = None,
 ) -> None:
     """Run the training dashboard HTTP server."""
 
@@ -381,10 +536,12 @@ def run_dashboard(
         jobs_dir=root / ".ygotrain/jobs",
         edopro_home=edopro_home or Path("/tmp/ygotrain/edopro-home"),
         gateway_script=root / "gateways/edopro-ocgcore/gateway.mjs",
+        human_catalog_dir=human_catalog_dir or DEFAULT_CATALOG_DIR,
     )
     DashboardHandler.state = DashboardState(settings)
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"YGO training dashboard running at http://{host}:{port}")
+    print(f"Human replay upload UI at http://{host}:{port}/replays")
     server.serve_forever()
 
 
@@ -396,12 +553,19 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--edopro-home", type=Path, default=Path("/tmp/ygotrain/edopro-home"))
+    parser.add_argument(
+        "--human-catalog-dir",
+        type=Path,
+        default=DEFAULT_CATALOG_DIR,
+        help="Directory for imported human replay JSON logs.",
+    )
     args = parser.parse_args()
     run_dashboard(
         host=args.host,
         port=args.port,
         repo_root=args.repo_root,
         edopro_home=args.edopro_home,
+        human_catalog_dir=args.human_catalog_dir,
     )
     return 0
 
@@ -439,7 +603,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
   <header>
     <h1>YGO Training Dashboard</h1>
-    <p>Start format-pack training, monitor jobs, and open reports from your phone.</p>
+    <p>Start format-pack training, monitor jobs, and open reports from your phone. <a href="/replays">Upload human replays →</a></p>
   </header>
   <main class="grid">
     <section>
@@ -540,6 +704,174 @@ DASHBOARD_HTML = r"""<!doctype html>
     document.querySelector('#start').addEventListener('click', startJob);
     setInterval(() => { loadJobs(); loadLog(); }, 3000);
     loadPacks().then(loadJobs).catch(err => msgEl.textContent = String(err));
+  </script>
+</body>
+</html>
+"""
+
+
+REPLAYS_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Human Replay Upload</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0f172a; --panel: #111827; --muted: #94a3b8; --text: #e5e7eb; --accent: #38bdf8; --ok: #22c55e; --bad: #ef4444; --warn: #f59e0b; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(180deg, #020617, var(--bg)); color: var(--text); }
+    header { padding: 24px 18px 8px; max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    h2 { margin: 0 0 10px; font-size: 20px; }
+    p { color: var(--muted); line-height: 1.45; }
+    main { display: grid; gap: 16px; padding: 16px; max-width: 1100px; margin: 0 auto; }
+    section { background: rgba(17, 24, 39, .92); border: 1px solid rgba(148, 163, 184, .18); border-radius: 18px; padding: 16px; box-shadow: 0 18px 60px rgba(0,0,0,.25); }
+    label { display: block; color: var(--muted); font-size: 13px; margin: 12px 0 6px; }
+    select, input, button { width: 100%; border-radius: 12px; border: 1px solid rgba(148, 163, 184, .25); padding: 12px; background: #020617; color: var(--text); font-size: 16px; }
+    button { margin-top: 14px; background: var(--accent); color: #082f49; border: 0; font-weight: 800; cursor: pointer; }
+    button.secondary { background: #334155; color: var(--text); }
+    button:disabled { opacity: .6; cursor: wait; }
+    .grid { display: grid; gap: 16px; }
+    .duel { border: 1px solid rgba(148, 163, 184, .16); border-radius: 14px; padding: 12px; margin-top: 10px; background: #020617; }
+    .pill { display: inline-block; padding: 4px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; background: #334155; margin-right: 6px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; background: #020617; border-radius: 12px; padding: 12px; border: 1px solid rgba(148, 163, 184, .16); }
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+    .hint { font-size: 13px; margin-top: 8px; }
+    a { color: var(--accent); }
+    @media (min-width: 850px) { .grid { grid-template-columns: 380px 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Human Replay Upload</h1>
+    <p>Upload JSON duel logs so the bot can analyze your lines and update its learned policy. <a href="/">← Training dashboard</a></p>
+  </header>
+  <main class="grid">
+    <section>
+      <h2>Upload replays</h2>
+      <p class="hint">Use full game logs or decisions-only JSON. EDOPro <code>.yrp</code> files must be converted first — see <code>data/human-duels/examples/</code>.</p>
+      <label for="files">Replay files (.json)</label>
+      <input id="files" type="file" accept=".json,application/json" multiple />
+      <button id="upload">Upload &amp; import</button>
+      <label for="study-agent">Study player (optional)</label>
+      <select id="study-agent"><option value="">All players / auto</option></select>
+      <label for="format">Format filter (optional)</label>
+      <select id="format"><option value="">All formats</option></select>
+      <button id="learn" class="secondary">Analyze &amp; learn from catalog</button>
+      <p id="message"></p>
+    </section>
+    <section>
+      <h2>Imported replays</h2>
+      <p id="stats">Loading catalog…</p>
+      <div id="duels"></div>
+    </section>
+    <section style="grid-column: 1 / -1;">
+      <h2>What the bot learned</h2>
+      <pre id="summary">Upload replays and click Analyze &amp; learn.</pre>
+    </section>
+  </main>
+  <script>
+    const msgEl = document.querySelector('#message');
+    const statsEl = document.querySelector('#stats');
+    const duelsEl = document.querySelector('#duels');
+    const summaryEl = document.querySelector('#summary');
+    const studySelect = document.querySelector('#study-agent');
+    const formatSelect = document.querySelector('#format');
+
+    async function json(url, options) {
+      const res = await fetch(url, options);
+      const text = await res.text();
+      if (!res.ok) throw new Error(text || res.statusText);
+      return text ? JSON.parse(text) : {};
+    }
+
+    function setMessage(text, ok) {
+      msgEl.textContent = text;
+      msgEl.className = ok ? 'ok' : 'bad';
+    }
+
+    function fillFilters(catalog) {
+      const agents = catalog.study_agents || [];
+      const formats = catalog.formats || [];
+      studySelect.innerHTML = '<option value="">All players / auto</option>' +
+        agents.map(a => `<option value="${a}">${a}</option>`).join('');
+      formatSelect.innerHTML = '<option value="">All formats</option>' +
+        formats.map(f => `<option value="${f}">${f}</option>`).join('');
+    }
+
+    async function loadCatalog() {
+      const catalog = await json('/api/human-duels');
+      statsEl.textContent = `${catalog.duel_count} replays · ${catalog.total_decisions} decisions in catalog`;
+      fillFilters(catalog);
+      duelsEl.innerHTML = (catalog.duels || []).map(d => `
+        <div class="duel">
+          <strong>${d.duel_id}</strong><br/>
+          <span class="pill">${d.format}</span>
+          ${d.study_agent ? `<span class="pill">study: ${d.study_agent}</span>` : ''}
+          <span class="pill">${d.decision_count} decisions</span>
+          <p>${d.player_a || '?'} vs ${d.player_b || '?'}${d.winner ? ` · winner: ${d.winner}` : ''}</p>
+        </div>
+      `).join('') || '<p>No replays imported yet.</p>';
+    }
+
+    async function loadSummary() {
+      const res = await fetch('/api/human-duels/summary');
+      summaryEl.textContent = await res.text();
+    }
+
+    async function uploadFiles() {
+      const input = document.querySelector('#files');
+      const button = document.querySelector('#upload');
+      if (!input.files.length) {
+        setMessage('Choose at least one .json file.', false);
+        return;
+      }
+      button.disabled = true;
+      setMessage('Uploading…', true);
+      try {
+        const form = new FormData();
+        for (const file of input.files) form.append('files', file, file.name);
+        const res = await fetch('/api/human-duels/upload', { method: 'POST', body: form });
+        const data = JSON.parse(await res.text());
+        if (!res.ok) throw new Error((data.errors && data.errors[0] && data.errors[0].error) || 'Upload failed');
+        const errCount = (data.errors || []).length;
+        setMessage(`Imported ${data.imported} replay(s)` + (errCount ? ` · ${errCount} error(s)` : ''), errCount === 0);
+        input.value = '';
+        await loadCatalog();
+      } catch (err) {
+        setMessage(String(err), false);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function learnFromCatalog() {
+      const button = document.querySelector('#learn');
+      button.disabled = true;
+      setMessage('Analyzing replays and updating policy…', true);
+      try {
+        const payload = {
+          study_agent: studySelect.value || null,
+          format: formatSelect.value || null,
+        };
+        const data = await json('/api/human-duels/learn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        summaryEl.textContent = data.summary || 'Learning complete.';
+        setMessage(`Learned from ${data.total_games} game(s), ${data.total_decisions} decision(s). Policy updated.`, true);
+      } catch (err) {
+        setMessage(String(err), false);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    document.querySelector('#upload').addEventListener('click', uploadFiles);
+    document.querySelector('#learn').addEventListener('click', learnFromCatalog);
+    loadCatalog().then(loadSummary).catch(err => setMessage(String(err), false));
   </script>
 </body>
 </html>

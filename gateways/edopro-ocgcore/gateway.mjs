@@ -8,10 +8,15 @@ import createCore, {
   OcgResponseType,
   SelectBattleCMDAction,
   SelectIdleCMDAction,
+  cardMatchesOpcode,
+  ocgAttributeParse,
+  ocgAttributeString,
   ocgMessageTypeStrings,
   ocgProcessResultString,
   ocgPositionParse,
   ocgPositionString,
+  ocgRaceParse,
+  ocgRaceString,
 } from "ocgcore-wasm";
 import Database from "better-sqlite3";
 import { createInterface } from "node:readline/promises";
@@ -28,79 +33,235 @@ const maxDecisions = Number(args.maxDecisions ?? 80);
 const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 const stdinIterator = rl[Symbol.asyncIterator]();
 const scriptCache = new Map();
-const scriptLoadStats = { loaded: 0, missing: 0, optional_missing: 0, errors: 0 };
+const CORE_LUA_PRELUDES = ["constant.lua", "utility.lua"];
+const scriptLoadStats = {
+  loaded: 0,
+  missing: 0,
+  optional_missing: 0,
+  errors: 0,
+  runtime_errors: 0,
+  prelude_loaded: [],
+};
 
 let players = ["bot-a", "bot-b"];
 let database;
+let duelDeckCards = [];
 let lib;
 let handle;
+let currentDuelSeed = [1n, 2n, 3n, 4n];
+let duelMode = OcgDuelMode.MODE_MR3;
+
+const HARD_STEP_LIMIT = 500_000;
+const STALL_STEP_THRESHOLD = 8_000;
+const RETRY_STALL_THRESHOLD = 2_500;
+const LOG_ENGINE_EVERY_STEPS = 10_000;
 
 async function runDuel() {
   let decisions = 0;
   let winner = null;
   let loser = null;
+  let endReason = null;
   let retryQueue = [];
+  let retryOnlySteps = 0;
   const lifePoints = [8000, 8000];
-
-  for (let step = 0; step < 10000; step += 1) {
+  let lastLpKey = `${lifePoints[0]}/${lifePoints[1]}`;
+  let lastLpChangeStep = 0;
+  let continueOnlyStreak = 0;
+  for (let step = 0; step < HARD_STEP_LIMIT; step += 1) {
     const status = await lib.duelProcess(handle);
     const messages = lib.duelGetMessage(handle);
-    emitLog({
-      event: "engine_messages",
-      step,
-      status: ocgProcessResultString.get(status) ?? status,
-      life_points: [...lifePoints],
-      messages: safe(messages),
-    });
+    const lpKey = `${lifePoints[0]}/${lifePoints[1]}`;
+    if (lpKey !== lastLpKey) {
+      lastLpKey = lpKey;
+      lastLpChangeStep = step;
+      retryOnlySteps = 0;
+    }
+    if (step === 0 || step % LOG_ENGINE_EVERY_STEPS === 0) {
+      emitLog({
+        event: "engine_progress",
+        step,
+        status: ocgProcessResultString.get(status) ?? status,
+        life_points: [...lifePoints],
+        decisions,
+        stall_steps: step - lastLpChangeStep,
+      });
+    }
+    let winMessage = null;
     for (const message of messages) {
-      if (message.type === OcgMessageType.WIN) {
-        winner = playerName(message.player);
-        loser = playerName(message.player === 0 ? 1 : 0);
-      } else if (message.type === OcgMessageType.DAMAGE) {
+      if (message.type === OcgMessageType.DAMAGE) {
         lifePoints[message.player] -= message.amount;
       } else if (message.type === OcgMessageType.RECOVER) {
         lifePoints[message.player] += message.amount;
       } else if (message.type === OcgMessageType.LPUPDATE) {
         lifePoints[message.player] = message.lp;
+      } else if (message.type === OcgMessageType.WIN) {
+        winMessage = message;
       }
+    }
+    if (winMessage) {
+      if (isDeckoutWinReason(winMessage.reason)) {
+        winner = playerName(winMessage.player);
+        loser = playerName(winMessage.player === 0 ? 1 : 0);
+        endReason = "deckout";
+      } else if (isLpWinReason(winMessage.reason) || outcomeFromLifePoints(lifePoints)) {
+        winner = playerName(winMessage.player);
+        loser = playerName(winMessage.player === 0 ? 1 : 0);
+        endReason = "lp";
+      } else {
+        emitLog({
+          event: decisions === 0 ? "ignored_premature_win" : "ignored_win",
+          reason: winMessage.reason,
+          life_points: [...lifePoints],
+          player: winMessage.player,
+        });
+      }
+    }
+    if (winner !== null && loser !== null) {
+      emitResult({
+        winner,
+        loser,
+        turns: countTurns(messages),
+        decisions,
+        end_reason: endReason ?? "lp",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", endReason ?? "lp"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
+
+    const lifeOutcome = outcomeFromLifePoints(lifePoints);
+    if (lifeOutcome) {
+      emitResult({
+        winner: lifeOutcome.winner,
+        loser: lifeOutcome.loser,
+        turns: countTurns(messages),
+        decisions,
+        end_reason: "lp",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "lp"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
+
+    const deckOutcome = outcomeFromDeckCounts();
+    if (deckOutcome) {
+      emitResult({
+        winner: deckOutcome.winner,
+        loser: deckOutcome.loser,
+        turns: countTurns(messages),
+        decisions,
+        end_reason: "deckout",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "deckout"],
+        script_stats: scriptLoadStats,
+      });
+      return;
     }
 
     if (status === OcgProcessResult.END) {
-      emitResult({ winner, loser, turns: countTurns(messages), decisions, tags: ["edopro", "ocgcore-wasm"], script_stats: scriptLoadStats });
-      return;
+      throw new Error(
+        `ocgcore duel ended without WIN or zero life points (LP ${lifePoints[0]}/${lifePoints[1]}).`,
+      );
     }
     if (status === OcgProcessResult.CONTINUE) {
+      continueOnlyStreak += 1;
+      const stallSteps = step - lastLpChangeStep;
+      if (stallSteps >= STALL_STEP_THRESHOLD && continueOnlyStreak >= 500) {
+        throw new Error(
+          `ocgcore CONTINUE stall at LP ${lifePoints[0]}/${lifePoints[1]} (stall_steps=${stallSteps}).`,
+        );
+      }
       continue;
     }
+    continueOnlyStreak = 0;
     if (status !== OcgProcessResult.WAITING) {
       throw new Error(`Unknown ocgcore process result: ${status}`);
     }
 
+    const stallSteps = step - lastLpChangeStep;
+    const forceProactive = stallSteps >= STALL_STEP_THRESHOLD;
+
     const selectable = [...messages].reverse().find((message) => legalActionsFor(message, lifePoints).length > 0);
     if (!selectable) {
       if (messages.some((message) => message.type === OcgMessageType.RETRY)) {
+        retryOnlySteps += 1;
+        if (retryOnlySteps >= STALL_STEP_THRESHOLD) {
+          throw new Error(
+            `ocgcore RETRY stall at LP ${lifePoints[0]}/${lifePoints[1]} (retry_only_steps=${retryOnlySteps}).`,
+          );
+        }
         if (retryQueue.length > 0) {
           const retryAction = retryQueue.shift();
           emitLog({ event: "retry_response", action: safe(retryAction) });
           lib.duelSetResponse(handle, retryAction.response);
           continue;
         }
-        const adjudicated = adjudicateByLifePoints(lifePoints);
-        emitResult({
-          winner: adjudicated.winner,
-          loser: adjudicated.loser,
-          turns: decisions,
-          decisions,
-          tags: ["edopro", "ocgcore-wasm", "retry-adjudication", adjudicated.tag],
-          script_stats: scriptLoadStats,
+        const fallback = pickSafeRetryResponse(messages, {
+          preferYes: forceProactive || retryOnlySteps > 200,
         });
-        return;
+        if (fallback) {
+          emitLog({ event: "retry_safe_fallback", response: safe({ ...fallback, response: undefined }) });
+          lib.duelSetResponse(handle, fallback.response);
+          continue;
+        }
+        throw new Error(
+          `ocgcore requested RETRY but no alternate responses remain: ${JSON.stringify(safe(messages))}`,
+        );
       }
       throw new Error(`ocgcore is waiting, but no supported selectable message was emitted: ${JSON.stringify(safe(messages))}`);
     }
+    retryOnlySteps = 0;
+
+    const legalActions = legalActionsFor(selectable, lifePoints);
+    if (forceProactive) {
+      const stallBreaker = chooseProactiveAction(legalActions)
+        ?? chooseLeastPassiveAction(legalActions, { skipPhasePass: true });
+      emitLog({
+        event: "stall_breaker",
+        stall_steps: stallSteps,
+        selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
+        selected_action: safe({ ...stallBreaker, response: undefined }),
+      });
+      lib.duelSetResponse(handle, stallBreaker.response);
+      continue;
+    }
+    const autoPass = chooseAutoPassAction(legalActions);
+    if (autoPass && !forceProactive) {
+      emitLog({
+        event: "auto_pass_turn",
+        selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
+        selected_action: safe({ ...autoPass, response: undefined }),
+      });
+      lib.duelSetResponse(handle, autoPass.response);
+      continue;
+    }
+
+    if (decisions >= maxDecisions) {
+      const forced = outcomeFromLifePoints(lifePoints) ?? {
+        winner: playerName(0),
+        loser: playerName(1),
+      };
+      emitLog({
+        event: "max_decisions_reached",
+        max_decisions: maxDecisions,
+        life_points: [...lifePoints],
+      });
+      emitResult({
+        winner: forced.winner,
+        loser: forced.loser,
+        turns: countTurns(messages),
+        decisions,
+        end_reason: "max_decisions",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "max_decisions"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
 
     decisions += 1;
-    const legalActions = legalActionsFor(selectable, lifePoints);
     const stateId = `ocgcore-${decisions}`;
     emitLog({
       event: "decision_state",
@@ -123,45 +284,185 @@ async function runDuel() {
 
     const actionMessage = await readJsonLine();
     const actionIndex = legalActions.findIndex((candidate) => candidate.action_id === actionMessage.action_id);
-    const action = legalActions[actionIndex];
-    if (!action) {
+    const requestedAction = legalActions[actionIndex];
+    if (!requestedAction) {
       throw new Error(`Unknown action_id ${actionMessage.action_id} for state ${stateId}.`);
     }
-    retryQueue = legalActions.filter((_candidate, index) => index !== actionIndex);
+    const action = forceLpPressureAction(legalActions, requestedAction) ?? requestedAction;
+    const effectiveIndex = legalActions.findIndex((candidate) => candidate.action_id === action.action_id);
+    retryQueue = legalActions.filter((_candidate, index) => index !== effectiveIndex);
     emitLog({
       event: "submit_response",
       state_id: stateId,
       requested_action: safe(actionMessage),
       selected_action: safe({ ...action, response: undefined }),
+      overridden_for_lp_pressure: action.action_id !== requestedAction.action_id,
       response: safe(action.response),
     });
     lib.duelSetResponse(handle, action.response);
-
-    if (decisions >= maxDecisions) {
-      const adjudicated = adjudicateByLifePoints(lifePoints);
-      emitResult({
-        winner: adjudicated.winner,
-        loser: adjudicated.loser,
-        turns: decisions,
-        decisions,
-        tags: ["edopro", "ocgcore-wasm", "max-decisions", adjudicated.tag],
-        script_stats: scriptLoadStats,
-      });
-      return;
-    }
   }
 
-  throw new Error("ocgcore gateway exceeded the hard step limit.");
+  throw new Error(
+    `ocgcore gateway exceeded the hard step limit (${HARD_STEP_LIMIT}) without a natural win at LP ${lifePoints[0]}/${lifePoints[1]} (stall_steps=${HARD_STEP_LIMIT - lastLpChangeStep}).`,
+  );
 }
 
-function adjudicateByLifePoints(lifePoints) {
-  if (lifePoints[0] > lifePoints[1]) {
-    return { winner: playerName(0), loser: playerName(1), tag: "lp-adjudication" };
+function outcomeFromDeckCounts() {
+  if (!lib || !handle) {
+    return null;
   }
-  if (lifePoints[1] > lifePoints[0]) {
-    return { winner: playerName(1), loser: playerName(0), tag: "lp-adjudication" };
+  for (let team = 0; team < 2; team += 1) {
+    const main = lib.duelQueryCount(handle, team, OcgLocation.DECK);
+    const extra = lib.duelQueryCount(handle, team, OcgLocation.EXTRA);
+    if (main + extra <= 0) {
+      return {
+        winner: playerName(team === 0 ? 1 : 0),
+        loser: playerName(team),
+      };
+    }
   }
-  return { winner: null, loser: null, tag: "draw" };
+  return null;
+}
+
+function chooseProactiveAction(legalActions) {
+  const predicates = [
+    (action) => (action.tags ?? []).includes("lethal"),
+    (action) => action.action_id.startsWith("attack-"),
+    (action) => (action.tags ?? []).includes("direct-attack"),
+    (action) => action.action_id.startsWith("normal-summon-"),
+    (action) => action.action_id.startsWith("special-summon-"),
+    (action) => action.action_id.startsWith("activate-"),
+    (action) => action.action_id.startsWith("set-monster-"),
+    (action) => action.action_id === "activate-effect",
+    (action) => action.action_id === "to-battle-phase",
+    (action) => action.action_id === "yes",
+  ];
+  for (const predicate of predicates) {
+    const match = legalActions.find(predicate);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function chooseLeastPassiveAction(legalActions, { skipPhasePass = false } = {}) {
+  const passiveTags = new Set(["phase", "decline"]);
+  const candidates = skipPhasePass
+    ? legalActions.filter(
+      (action) => action.action_id !== "to-end-phase" && action.action_id !== "to-main-phase-2",
+    )
+    : legalActions;
+  const nonPassive = candidates.filter((action) => {
+    const tags = action.tags ?? [];
+    return tags.some((tag) => !passiveTags.has(tag)) && !action.action_id.startsWith("decline-");
+  });
+  return (
+    nonPassive.find((action) => action.action_id.startsWith("attack-"))
+    ?? nonPassive.find((action) => action.action_id.startsWith("normal-summon-"))
+    ?? nonPassive[0]
+    ?? candidates.find((action) => action.action_id === "to-battle-phase")
+    ?? candidates.find((action) => action.action_id === "to-end-phase")
+    ?? candidates[0]
+    ?? legalActions[0]
+  );
+}
+
+function forceLpPressureAction(legalActions, requestedAction) {
+  const attack = legalActions.find((action) => action.action_id.startsWith("attack-"));
+  if (attack && requestedAction.action_id !== attack.action_id) {
+    return attack;
+  }
+  const toBattle = legalActions.find((action) => action.action_id === "to-battle-phase");
+  if (toBattle && requestedAction.action_id === "to-end-phase") {
+    return toBattle;
+  }
+  const summon = legalActions.find((action) => action.action_id.startsWith("normal-summon-"));
+  if (summon && requestedAction.action_id.startsWith("set-")) {
+    return summon;
+  }
+  return null;
+}
+
+// ocgcore WIN reason flags (Fluorohydride/ygopro duelconstants.h).
+const WIN_REASON_DECKOUT = 0x04;
+const WIN_REASON_LOSE_LP = 0x10;
+
+function isDeckoutWinReason(reason) {
+  const code = Number(reason ?? 0);
+  return Boolean(code & WIN_REASON_DECKOUT);
+}
+
+function isLpWinReason(reason) {
+  const code = Number(reason ?? 0);
+  return Boolean(code & WIN_REASON_LOSE_LP);
+}
+
+function outcomeFromLifePoints(lifePoints) {
+  if (lifePoints[0] <= 0 && lifePoints[1] > 0) {
+    return { winner: playerName(1), loser: playerName(0) };
+  }
+  if (lifePoints[1] <= 0 && lifePoints[0] > 0) {
+    return { winner: playerName(0), loser: playerName(1) };
+  }
+  return null;
+}
+
+function pickSafeRetryResponse(messages, { preferYes = false } = {}) {
+  for (const message of messages) {
+    const actions = legalActionsFor(message, [8000, 8000]);
+    if (preferYes) {
+      const yes = actions.find((action) => action.action_id === "yes" || action.action_id === "activate-effect");
+      if (yes) {
+        return yes;
+      }
+    }
+    const proactive = chooseProactiveAction(actions);
+    if (proactive) {
+      return proactive;
+    }
+    const fallbackActions = actions.filter((action) => (action.tags ?? []).includes("decline"));
+    if (fallbackActions.length > 0) {
+      return fallbackActions[0];
+    }
+  }
+  return {
+    action_id: "retry-decline-effect",
+    label: "Decline effect (retry fallback)",
+    tags: ["effect", "decline"],
+    response: { type: OcgResponseType.SELECT_EFFECTYN, yes: false },
+  };
+}
+
+function chooseAutoPassAction(legalActions) {
+  if (!legalActions.length) {
+    return null;
+  }
+  const passiveTags = new Set(["phase", "decline", "shuffle", "yes-no", "select-unselect"]);
+  const passivePrefixes = [
+    "to-",
+    "decline-",
+    "cancel-",
+    "finish-",
+  ];
+  const hasProactiveAction = legalActions.some((action) => {
+    const tags = action.tags ?? [];
+    const hasActiveTag = tags.some((tag) => !passiveTags.has(tag));
+    const hasActivePrefix = !passivePrefixes.some((prefix) => action.action_id.startsWith(prefix));
+    return hasActiveTag && hasActivePrefix;
+  });
+  if (hasProactiveAction) {
+    return null;
+  }
+  return (
+    legalActions.find((action) => action.action_id === "to-end-phase")
+    ?? legalActions.find((action) => action.action_id === "to-main-phase-2")
+    ?? legalActions.find((action) => action.action_id === "to-battle-phase")
+    ?? legalActions.find((action) => action.action_id.startsWith("decline-"))
+    ?? legalActions.find((action) => action.action_id === "finish-selection")
+    ?? legalActions.find((action) => action.action_id === "cancel-selection")
+    ?? legalActions[0]
+  );
 }
 
 
@@ -174,21 +475,11 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
     case OcgMessageType.SELECT_CHAIN:
       return chainActions(message);
     case OcgMessageType.SELECT_CARD:
-      return message.selects.map((card, index) => ({
-        action_id: `select-card-${index}`,
-        label: `Select ${cardName(card.code)}`,
-        tags: ["select-card", ...effectTagsForCard(card.code)],
-        response: { type: OcgResponseType.SELECT_CARD, indicies: [index] },
-      }));
+      return selectCardActions(message);
     case OcgMessageType.SELECT_UNSELECT_CARD:
       return selectUnselectActions(message);
     case OcgMessageType.SELECT_TRIBUTE:
-      return message.selects.map((card, index) => ({
-        action_id: `select-tribute-${index}`,
-        label: `Tribute ${cardName(card.code)}`,
-        tags: ["tribute"],
-        response: { type: OcgResponseType.SELECT_TRIBUTE, indicies: [index] },
-      }));
+      return selectTributeActions(message);
     case OcgMessageType.SELECT_POSITION:
       return ocgPositionParse(message.positions).map((position) => ({
         action_id: `position-${position}`,
@@ -197,12 +488,15 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
         response: { type: OcgResponseType.SELECT_POSITION, position },
       }));
     case OcgMessageType.SELECT_OPTION:
-      return message.options.map((_option, index) => ({
-        action_id: `option-${index}`,
-        label: `Choose option ${index + 1}`,
-        tags: ["option"],
-        response: { type: OcgResponseType.SELECT_OPTION, index },
-      }));
+      return selectOptionActions(message);
+    case OcgMessageType.ANNOUNCE_NUMBER:
+      return announceNumberActions(message);
+    case OcgMessageType.ANNOUNCE_RACE:
+      return announceRaceActions(message);
+    case OcgMessageType.ANNOUNCE_ATTRIB:
+      return announceAttributeActions(message);
+    case OcgMessageType.ANNOUNCE_CARD:
+      return announceCardActions(message);
     case OcgMessageType.SELECT_PLACE:
       return fieldPlaceActions(message, OcgResponseType.SELECT_PLACE);
     case OcgMessageType.SELECT_DISFIELD:
@@ -228,6 +522,156 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
     default:
       return [];
   }
+}
+
+function selectOptionActions(message) {
+  return message.options.map((_option, index) => ({
+    action_id: `option-${index}`,
+    label: `Choose option ${index + 1}`,
+    tags: ["option"],
+    response: { type: OcgResponseType.SELECT_OPTION, index },
+  }));
+}
+
+function announceNumberActions(message) {
+  return message.options.map((option, index) => {
+    const value = Number(option);
+    return {
+      action_id: `announce-number-${index}`,
+      label: `Announce ${Number.isFinite(value) ? value : String(option)}`,
+      tags: ["announce-number", "option"],
+      response: { type: OcgResponseType.ANNOUNCE_NUMBER, value },
+    };
+  });
+}
+
+function announceRaceActions(message) {
+  const available = BigInt(message.available ?? 0);
+  const races = ocgRaceParse(available);
+  const pickCount = Math.max(1, Number(message.count ?? 1));
+  if (pickCount === 1) {
+    return races.map((race, index) => ({
+      action_id: `announce-race-${index}`,
+      label: `Announce ${ocgRaceString.get(race) ?? race}`,
+      tags: ["announce-race", "option"],
+      response: { type: OcgResponseType.ANNOUNCE_RACE, races: [race] },
+    }));
+  }
+  const subset = races.slice(0, pickCount);
+  return [{
+    action_id: "announce-race-combo",
+    label: `Announce ${subset.map((race) => ocgRaceString.get(race) ?? race).join(", ")}`,
+    tags: ["announce-race", "option"],
+    response: { type: OcgResponseType.ANNOUNCE_RACE, races: subset },
+  }];
+}
+
+function announceAttributeActions(message) {
+  const available = Number(message.available ?? 0);
+  const attributes = ocgAttributeParse(available);
+  const pickCount = Math.max(1, Number(message.count ?? 1));
+  if (pickCount === 1) {
+    return attributes.map((attribute, index) => ({
+      action_id: `announce-attribute-${index}`,
+      label: `Announce ${ocgAttributeString.get(attribute) ?? attribute}`,
+      tags: ["announce-attribute", "option"],
+      response: { type: OcgResponseType.ANNOUNCE_ATTRIB, attributes: [attribute] },
+    }));
+  }
+  const subset = attributes.slice(0, pickCount);
+  return [{
+    action_id: "announce-attribute-combo",
+    label: `Announce ${subset.map((attribute) => ocgAttributeString.get(attribute) ?? attribute).join(", ")}`,
+    tags: ["announce-attribute", "option"],
+    response: { type: OcgResponseType.ANNOUNCE_ATTRIB, attributes: subset },
+  }];
+}
+
+function announceCardActions(message) {
+  const opcodes = message.opcodes ?? [];
+  const matches = [];
+  for (const code of duelDeckCards) {
+    const card = database?.readCard(code);
+    if (!card) {
+      continue;
+    }
+    if (opcodes.every((opcode) => cardMatchesOpcode(card, [opcode]))) {
+      matches.push(code);
+    }
+  }
+  if (matches.length === 0) {
+    return [{
+      action_id: "announce-card-fallback",
+      label: "Announce card (fallback)",
+      tags: ["announce-card", "fallback"],
+      response: { type: OcgResponseType.ANNOUNCE_CARD, card: 0 },
+    }];
+  }
+  return matches.map((code, index) => ({
+    action_id: `announce-card-${index}`,
+    label: `Announce ${cardName(code)}`,
+    tags: ["announce-card", ...effectTagsForCard(code)],
+    response: { type: OcgResponseType.ANNOUNCE_CARD, card: code },
+  }));
+}
+
+function selectCardActions(message) {
+  const actions = [];
+  if (message.can_cancel) {
+    actions.push({
+      action_id: "cancel-select-card",
+      label: "Cancel selection",
+      tags: ["select-card", "decline"],
+      response: { type: OcgResponseType.SELECT_CARD, indicies: null },
+    });
+  }
+  const min = Number(message.min ?? 1);
+  const pickCount = Math.max(1, Math.min(min, message.selects.length));
+  message.selects.forEach((card, index) => actions.push({
+    action_id: `select-card-${index}`,
+    label: `Select ${cardName(card.code)}`,
+    tags: ["select-card", ...effectTagsForCard(card.code)],
+    response: {
+      type: OcgResponseType.SELECT_CARD,
+      indicies: buildSelectionIndices(index, pickCount, message.selects.length),
+    },
+  }));
+  return actions;
+}
+
+function selectTributeActions(message) {
+  const actions = [];
+  if (message.can_cancel) {
+    actions.push({
+      action_id: "cancel-select-tribute",
+      label: "Cancel tribute selection",
+      tags: ["tribute", "decline"],
+      response: { type: OcgResponseType.SELECT_TRIBUTE, indicies: null },
+    });
+  }
+  const min = Number(message.min ?? 1);
+  const pickCount = Math.max(1, Math.min(min, message.selects.length));
+  message.selects.forEach((card, index) => actions.push({
+    action_id: `select-tribute-${index}`,
+    label: `Tribute ${cardName(card.code)}`,
+    tags: ["tribute"],
+    response: {
+      type: OcgResponseType.SELECT_TRIBUTE,
+      indicies: buildSelectionIndices(index, pickCount, message.selects.length),
+    },
+  }));
+  return actions;
+}
+
+function buildSelectionIndices(preferredIndex, count, total) {
+  const picks = [preferredIndex];
+  for (let offset = 1; picks.length < count && offset < total; offset += 1) {
+    const candidate = (preferredIndex + offset) % total;
+    if (!picks.includes(candidate)) {
+      picks.push(candidate);
+    }
+  }
+  return picks;
 }
 
 function idleActions(message, lifePoints) {
@@ -490,6 +934,21 @@ async function addDeck(core, duelHandle, team, cards) {
   })));
 }
 
+async function addExtraDeck(core, duelHandle, team, cards) {
+  if (!cards.length) {
+    return;
+  }
+  await Promise.all(cards.map((code, sequence) => core.duelNewCard(duelHandle, {
+    team,
+    duelist: 0,
+    code,
+    controller: team,
+    location: OcgLocation.EXTRA,
+    sequence,
+    position: OcgPosition.FACEDOWN_DEFENSE,
+  })));
+}
+
 function readScript(scriptName) {
   if (scriptCache.has(scriptName)) {
     return scriptCache.get(scriptName);
@@ -522,16 +981,60 @@ function readScript(scriptName) {
 }
 
 function resolveScriptPath(scriptName) {
-  const candidates = /^c\d+\.lua$/.test(scriptName)
-    ? [
-        path.join(edoproHome, "script", "official", scriptName),
-        path.join(edoproHome, "script", scriptName),
-      ]
-    : [
-        path.join(edoproHome, "script", scriptName),
-        path.join(edoproHome, "script", "official", scriptName),
-      ];
+  const scriptRoot = path.join(edoproHome, "script");
+  const candidates = [];
+  if (/^c\d+\.lua$/.test(scriptName)) {
+    candidates.push(
+      path.join(scriptRoot, "official", scriptName),
+      path.join(scriptRoot, scriptName),
+    );
+  } else if (/proc_unofficial\.lua$/.test(scriptName)) {
+    candidates.push(path.join(scriptRoot, "unofficial", scriptName));
+  } else {
+    candidates.push(
+      path.join(scriptRoot, scriptName),
+      path.join(scriptRoot, "official", scriptName),
+      path.join(scriptRoot, "unofficial", scriptName),
+    );
+  }
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function loadCoreLuaPreludes(core, duelHandle) {
+  for (const scriptName of CORE_LUA_PRELUDES) {
+    const scriptPath = path.join(edoproHome, "script", scriptName);
+    if (!existsSync(scriptPath)) {
+      throw new Error(
+        `Missing EDOPro core Lua prelude ${scriptName} at ${scriptPath}. ` +
+          "Re-run scripts/bootstrap_edopro_home.sh or verify ProjectIgnis/script/.",
+      );
+    }
+    const content = readFileSync(scriptPath, "utf8");
+    const loaded = core.loadScript(duelHandle, scriptName, content);
+    if (!loaded) {
+      throw new Error(`ocgcore failed to load core Lua prelude: ${scriptName}`);
+    }
+    scriptLoadStats.prelude_loaded.push(scriptName);
+    emitLog({ event: "script_prelude_loaded", script: scriptName, path: path.relative(edoproHome, scriptPath) });
+  }
+}
+
+function isScriptRuntimeError(text) {
+  const message = String(text ?? "");
+  return (
+    message.includes("GetID") ||
+    message.includes("CallCardFunction") ||
+    message.includes("attempt to call a nil value") ||
+    message.includes("attempt to call an error function")
+  );
+}
+
+function trackScriptRuntimeError(text) {
+  if (!isScriptRuntimeError(text)) {
+    return;
+  }
+  scriptLoadStats.runtime_errors += 1;
+  emitLog({ event: "script_runtime_error", message: String(text).slice(0, 240) });
 }
 
 function isOptionalMissingScript(scriptName) {
@@ -546,7 +1049,22 @@ function isOptionalMissingScript(scriptName) {
   return row ? isVanillaMonster(row.type) : false;
 }
 
-function validateDeckScripts(deckA, deckB) {
+function validateCoreLuaPreludes() {
+  const missing = CORE_LUA_PRELUDES.filter(
+    (scriptName) => !existsSync(path.join(edoproHome, "script", scriptName)),
+  );
+  if (missing.length) {
+    throw new Error(
+      `EDOPro home is missing core Lua preludes: ${missing.join(", ")} under ${path.join(edoproHome, "script")}`,
+    );
+  }
+}
+
+function validateDeckScripts(mainA, mainB, extraA = [], extraB = []) {
+  validateDeckCardScripts([...mainA, ...extraA], [...mainB, ...extraB]);
+}
+
+function validateDeckCardScripts(deckA, deckB) {
   const uniqueCodes = [...new Set([...deckA, ...deckB])];
   const missingData = [];
   const missingScripts = [];
@@ -637,15 +1155,62 @@ function countTurns(messages) {
   return Math.max(1, turns);
 }
 
-function parseDeck(value, fallback) {
-  if (!value) {
-    return fallback;
+function parseDeckList(value, { minimum = 0, fallback = null } = {}) {
+  if (value === undefined || value === null) {
+    if (fallback !== null) {
+      return [...fallback];
+    }
+    return [];
+  }
+  if (Array.isArray(value)) {
+    const parsed = value.map((item) => Number(item)).filter(Boolean);
+    if (minimum > 0 && parsed.length < minimum) {
+      throw new Error(`Deck lists must contain at least ${minimum} card IDs.`);
+    }
+    return parsed;
   }
   const parsed = String(value).split(",").map((item) => Number(item.trim())).filter(Boolean);
-  if (parsed.length < 40) {
-    throw new Error("Deck lists must contain at least 40 comma-separated card IDs.");
+  if (minimum > 0 && parsed.length < minimum) {
+    throw new Error(`Deck lists must contain at least ${minimum} comma-separated card IDs.`);
   }
   return parsed;
+}
+
+function parseDeck(value, fallback) {
+  return parseDeckList(value, { minimum: 40, fallback });
+}
+
+function parseExtraDeck(value) {
+  const parsed = parseDeckList(value, { minimum: 0 });
+  if (parsed.length > 15) {
+    throw new Error("Extra deck lists may contain at most 15 card IDs.");
+  }
+  return parsed;
+}
+
+function parsePlayerDecks(message, teamKey, fallbackMain) {
+  const deckValue = message[teamKey];
+  const extraKey = teamKey === "deck_a" ? "extra_a" : "extra_b";
+  if (deckValue && typeof deckValue === "object" && !Array.isArray(deckValue)) {
+    return {
+      main: parseDeckList(deckValue.main, { minimum: 40, fallback: fallbackMain }),
+      extra: parseExtraDeck(deckValue.extra),
+    };
+  }
+  return {
+    main: parseDeck(deckValue, fallbackMain),
+    extra: parseExtraDeck(message[extraKey]),
+  };
+}
+
+function parseSeed(value) {
+  if (!value) {
+    return null;
+  }
+  if (!Array.isArray(value) || value.length !== 4) {
+    throw new Error("seed must be an array of four unsigned 64-bit integers.");
+  }
+  return value.map((part) => BigInt(part));
 }
 
 function parseArgs(argv) {
@@ -660,6 +1225,8 @@ function parseArgs(argv) {
       parsed.deckA = argv[++index];
     } else if (arg === "--deck-b") {
       parsed.deckB = argv[++index];
+    } else if (arg === "--duel-mode") {
+      parsed.duelMode = argv[++index];
     }
   }
   return parsed;
@@ -687,6 +1254,38 @@ function emitResult(result) {
 
 function safe(value) {
   return JSON.parse(JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item)));
+}
+
+function resolveDuelMode(startMessage) {
+  const requested = String(startMessage?.duel_mode ?? args.duelMode ?? "mr3").toLowerCase();
+  if (requested === "mr5") {
+    return OcgDuelMode.MODE_MR5;
+  }
+  if (requested === "mr4") {
+    return OcgDuelMode.MODE_MR4;
+  }
+  if (requested === "mr2") {
+    return OcgDuelMode.MODE_MR2;
+  }
+  if (requested === "mr1") {
+    return OcgDuelMode.MODE_MR1;
+  }
+  return OcgDuelMode.MODE_MR3;
+}
+
+function resolveDatabasePath(home) {
+  const candidates = [
+    path.join(home, "cards.cdb"),
+    path.join(home, "expansions", "cards.cdb"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(
+    `No card database found under ${home}. Expected cards.cdb or expansions/cards.cdb.`,
+  );
 }
 
 function splitSetcode(value) {
@@ -769,33 +1368,55 @@ async function main() {
   }
 
   players = startMessage.players ?? ["bot-a", "bot-b"];
-  const deckA = parseDeck(startMessage.deck_a ?? args.deckA, DEFAULT_DECK_A);
-  const deckB = parseDeck(startMessage.deck_b ?? args.deckB, DEFAULT_DECK_B);
+  const decksA = parsePlayerDecks(startMessage, "deck_a", DEFAULT_DECK_A);
+  const decksB = parsePlayerDecks(startMessage, "deck_b", DEFAULT_DECK_B);
+  duelDeckCards = [...new Set([...decksA.main, ...decksA.extra, ...decksB.main, ...decksB.extra])];
+  currentDuelSeed = parseSeed(startMessage.seed) ?? [1n, 2n, 3n, 4n];
 
-  database = new CardDatabase(path.join(edoproHome, "cards.cdb"));
-  validateDeckScripts(deckA, deckB);
+  const databasePath = resolveDatabasePath(edoproHome);
+  emitLog({ event: "database_loaded", path: path.relative(edoproHome, databasePath) });
+  database = new CardDatabase(databasePath);
+  validateDeckScripts(decksA.main, decksB.main, decksA.extra, decksB.extra);
+  validateCoreLuaPreludes();
+  emitLog({
+    event: "deck_loaded",
+    deck_a_main: decksA.main.length,
+    deck_a_extra: decksA.extra.length,
+    deck_b_main: decksB.main.length,
+    deck_b_extra: decksB.extra.length,
+  });
   lib = await createCore({
     sync: true,
     print: () => {},
     printErr: (line) => emitLog(line),
   });
 
+  duelMode = resolveDuelMode(startMessage);
+  emitLog({ event: "duel_mode", mode: String(duelMode) });
+
   handle = await lib.createDuel({
-    flags: OcgDuelMode.MODE_MR5,
-    seed: [1n, 2n, 3n, 4n],
+    flags: duelMode,
+    seed: currentDuelSeed,
     team1: { startingLP: 8000, startingDrawCount: 5, drawCountPerTurn: 1 },
     team2: { startingLP: 8000, startingDrawCount: 5, drawCountPerTurn: 1 },
     cardReader: (code) => database.readCard(code),
     scriptReader: readScript,
-    errorHandler: (_type, text) => emitLog(text),
+    errorHandler: (_type, text) => {
+      trackScriptRuntimeError(text);
+      emitLog(text);
+    },
   });
   if (!handle) {
     throw new Error("ocgcore failed to create a duel.");
   }
 
+  loadCoreLuaPreludes(lib, handle);
+
   try {
-    await addDeck(lib, handle, 0, deckA);
-    await addDeck(lib, handle, 1, deckB);
+    await addDeck(lib, handle, 0, decksA.main);
+    await addExtraDeck(lib, handle, 0, decksA.extra);
+    await addDeck(lib, handle, 1, decksB.main);
+    await addExtraDeck(lib, handle, 1, decksB.extra);
     await lib.startDuel(handle);
     await runDuel();
   } finally {

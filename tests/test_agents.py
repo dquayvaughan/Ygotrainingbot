@@ -21,6 +21,7 @@ def test_heuristic_agent_prefers_proactive_action_over_phase_end() -> None:
 def test_create_agent_builds_known_policies() -> None:
     assert create_agent("first-legal", "a").name == "a"
     assert create_agent("heuristic", "b").name == "b"
+    assert create_agent("search-control", "c").name == "c"
 
 
 def test_aggressive_agent_prefers_lethal_attack() -> None:

@@ -1,9 +1,4 @@
 {
-  "name": "edison-2010",
-  "description": "Representative Edison-era training pack with Quickdraw and Frog Monarch topping-style shells. Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
-  "games": 25,
-  "max_decisions": 80,
-  "banlist_source": "Representative March 2010 Edison-era limits compiled for training metadata.",
   "banlist": {
     "forbidden": [
       72989439,
@@ -35,11 +30,10 @@
       29401950
     ]
   },
+  "banlist_source": "Representative March 2010 Edison-era limits compiled for training metadata.",
   "decks": [
     {
-      "name": "Quickdraw Dandywarrior representative top shell",
       "archetype": "Quickdraw Dandywarrior",
-      "source": "Representative Edison Quickdraw shell inspired by 2010 topping lists; normalized to card IDs for ocgcore training.",
       "main": [
         20932152,
         20932152,
@@ -81,12 +75,24 @@
         29401950,
         29401950,
         58120309
+      ],
+      "name": "Quickdraw Dandywarrior representative top shell",
+      "source": "Representative Edison Quickdraw shell inspired by 2010 topping lists; normalized to card IDs for ocgcore training.",
+      "extra": [
+        50321796,
+        52687916,
+        44508094,
+        7391448,
+        23693634,
+        26593852,
+        60800381,
+        73580471,
+        76774528,
+        2403771
       ]
     },
     {
-      "name": "Frog Monarch representative top shell",
       "archetype": "Frog Monarch",
-      "source": "Representative Edison Frog Monarch shell inspired by 2010 topping lists; normalized to card IDs for ocgcore training.",
       "main": [
         9126351,
         9126351,
@@ -128,7 +134,23 @@
         44095762,
         53582587,
         64697231
+      ],
+      "name": "Frog Monarch representative top shell",
+      "source": "Representative Edison Frog Monarch shell inspired by 2010 topping lists; normalized to card IDs for ocgcore training.",
+      "extra": [
+        52687916,
+        50321796,
+        26593852,
+        44508094,
+        7391448,
+        23693634,
+        76774528,
+        73580471
       ]
     }
-  ]
+  ],
+  "description": "Representative Edison-era training pack with Quickdraw and Frog Monarch topping-style shells. Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
+  "games": 25,
+  "max_decisions": 80,
+  "name": "edison-2010"
 }

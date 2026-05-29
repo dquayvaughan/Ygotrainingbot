@@ -68,19 +68,19 @@ class ScoredHeuristicAgent:
 
     TAG_SCORES = {
         "lethal": 10_000,
-        "destroy-monster": 160,
-        "removal": 150,
+        "destroy-monster": 120,
+        "removal": 100,
         "negate": 145,
         "battle-trap": 125,
         "protect": 115,
-        "direct-attack": 80,
-        "attack": 100,
-        "normal-summon": 90,
-        "special-summon": 88,
+        "direct-attack": 220,
+        "attack": 200,
+        "normal-summon": 140,
+        "special-summon": 130,
         "activate": 70,
         "effect": 65,
         "set-monster": 45,
-        "set-spell": 35,
+        "set-spell": 5,
         "draw": 75,
         "search": 70,
         "banish": 90,
@@ -89,11 +89,11 @@ class ScoredHeuristicAgent:
         "position": 15,
         "chain": 15,
         "decline": -70,
-        "phase": -20,
+        "phase": -40,
     }
     LABEL_SCORES = {
         "go to end phase": -80,
-        "go to battle phase": 25,
+        "go to battle phase": 120,
         "go to main phase 2": -10,
         "do not chain": -30,
         "do not activate": -40,
@@ -218,10 +218,82 @@ class TempoHeuristicAgent(ScoredHeuristicAgent):
         "normal-summon": 140,
         "special-summon": 150,
         "activate": 90,
+        "attack": 170,
+        "direct-attack": 150,
         "set-monster": 65,
+        "set-spell": 25,
         "zone": 30,
         "phase": -35,
     }
+
+
+class ShallowSearchAgent:
+    """Phase 3 tactical agent: re-rank top-K heuristic moves with LP-aware search."""
+
+    def __init__(
+        self,
+        base: ScoredHeuristicAgent,
+        *,
+        search_depth: int = 1,
+        top_k: int = 8,
+    ) -> None:
+        if search_depth < 1 or search_depth > 2:
+            raise ValueError("search_depth must be 1 or 2")
+        self._base = base
+        self._search_depth = search_depth
+        self._top_k = max(1, top_k)
+
+    @property
+    def name(self) -> str:
+        return self._base.name
+
+    def choose_action(self, state: VisibleGameState) -> GameAction:
+        if not state.legal_actions:
+            raise ValueError(f"State {state.state_id!r} has no legal actions.")
+
+        ranked = sorted(
+            self._base.evaluate_actions(state),
+            key=lambda evaluation: evaluation.score,
+            reverse=True,
+        )
+        if len(ranked) <= 1:
+            return state.legal_actions[0]
+
+        from ygotrainingbot.tactical import (
+            follow_up_bonus,
+            opponent_reply_penalty,
+            tactical_action_bonus,
+            tactical_context_from_state,
+        )
+
+        context = tactical_context_from_state(state)
+        actions_by_id = {action.action_id: action for action in state.legal_actions}
+        best_action_id = ranked[0].action_id
+        best_score = float("-inf")
+
+        for evaluation in ranked[: min(self._top_k, len(ranked))]:
+            action = actions_by_id.get(evaluation.action_id)
+            if action is None:
+                continue
+            score = evaluation.score
+            if context is not None:
+                score += tactical_action_bonus(context, action, state.legal_actions)
+            if self._search_depth >= 1:
+                score -= opponent_reply_penalty(context, action, state.legal_actions)
+            if self._search_depth >= 2:
+                score += follow_up_bonus(context, action, state.legal_actions)
+            if score > best_score:
+                best_score = score
+                best_action_id = evaluation.action_id
+
+        return actions_by_id[best_action_id]
+
+    def evaluate_actions(self, state: VisibleGameState) -> tuple[ActionEvaluation, ...]:
+        return self._base.evaluate_actions(state)
+
+    def explain_decision(self, state: VisibleGameState, action: GameAction) -> str:
+        base_note = self._base.explain_decision(state, action)
+        return f"{base_note}; search_depth={self._search_depth}; top_k={self._top_k}"
 
 
 class ControlHeuristicAgent(ScoredHeuristicAgent):
@@ -231,33 +303,28 @@ class ControlHeuristicAgent(ScoredHeuristicAgent):
         **ScoredHeuristicAgent.TAG_SCORES,
         "activate": 100,
         "effect": 95,
-        "chain": 70,
+        "chain": 90,
         "negate": 180,
         "removal": 150,
         "battle-trap": 145,
         "protect": 150,
         "draw": 110,
         "search": 100,
-        "set-spell": 120,
+        "set-spell": 45,
         "set-monster": 60,
-        "normal-summon": 50,
-        "attack": 55,
+        "normal-summon": 90,
+        "attack": 160,
+        "direct-attack": 140,
         "phase": -10,
     }
 
 
-def create_agent(
+def _heuristic_agent_for_policy(
     policy: str,
-    name: str | None = None,
-    learned_weights: dict[str, float] | None = None,
-) -> DuelAgent:
-    """Create an agent by policy slug."""
-
+    name: str | None,
+    learned_weights: dict[str, float] | None,
+) -> ScoredHeuristicAgent:
     normalized = policy.strip().lower()
-    if normalized in {"first", "first-legal", "first-legal-action", "baseline"}:
-        return FirstLegalActionAgent(name or "first-legal-action")
-    if normalized in {"random", "random-legal"}:
-        return RandomLegalActionAgent(name or "random-legal")
     if normalized in {"heuristic", "heuristic-aggressive"}:
         return HeuristicActionAgent(name or "heuristic-aggressive", learned_weights)
     if normalized in {"aggressive", "aggressive-heuristic"}:
@@ -266,7 +333,39 @@ def create_agent(
         return TempoHeuristicAgent(name or "tempo-heuristic", learned_weights)
     if normalized in {"control", "control-heuristic"}:
         return ControlHeuristicAgent(name or "control-heuristic", learned_weights)
-    raise ValueError(f"Unknown agent policy {policy!r}.")
+    raise ValueError(f"Unknown heuristic policy {policy!r}.")
+
+
+def create_agent(
+    policy: str,
+    name: str | None = None,
+    learned_weights: dict[str, float] | None = None,
+    *,
+    search_depth: int | None = None,
+    search_top_k: int = 8,
+) -> DuelAgent:
+    """Create an agent by policy slug."""
+
+    normalized = policy.strip().lower()
+    if normalized.startswith("search-"):
+        base_policy = normalized.removeprefix("search-")
+        depth = 2 if base_policy.endswith("-2") else 1
+        if base_policy.endswith("-2"):
+            base_policy = base_policy[:-2]
+        base = _heuristic_agent_for_policy(base_policy, name, learned_weights)
+        return ShallowSearchAgent(
+            base,
+            search_depth=search_depth if search_depth is not None else depth,
+            top_k=search_top_k,
+        )
+    if search_depth is not None and search_depth > 0:
+        base = _heuristic_agent_for_policy(normalized, name, learned_weights)
+        return ShallowSearchAgent(base, search_depth=min(2, search_depth), top_k=search_top_k)
+    if normalized in {"first", "first-legal", "first-legal-action", "baseline"}:
+        return FirstLegalActionAgent(name or "first-legal-action")
+    if normalized in {"random", "random-legal"}:
+        return RandomLegalActionAgent(name or "random-legal")
+    return _heuristic_agent_for_policy(normalized, name, learned_weights)
 
 
 def _numeric_tag_value(tag: str) -> float:

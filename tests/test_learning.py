@@ -67,6 +67,43 @@ def test_learn_from_report_writes_policy_and_plain_english(tmp_path: Path) -> No
     assert policy["observations"] == 2
     assert policy["tag_weights"]["phase"] < 0
     assert policy["tag_weights"]["attack"] > 0
+    assert policy["tag_weights"]["normal-summon"] > 0
+
+
+def test_learn_from_report_applies_mistake_mining(tmp_path: Path) -> None:
+    report_path = tmp_path / "mistake-report.json"
+    policy_path = tmp_path / "policy.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "format": "mistake-test",
+                "games": 1,
+                "draws": 0,
+                "traced_decisions": 1,
+                "tags": {"phase": 1},
+                "decision_samples": [
+                    {
+                        "turn": 1,
+                        "agent": "bot-01",
+                        "summary": "Main phase",
+                        "selected_action": "to-end-phase",
+                        "selected_tags": ["phase"],
+                        "evaluation": (
+                            "selected_score=-90.00; top_alternatives=["
+                            "{'action_id': 'attack-0', 'label': 'Attack', "
+                            "'score': 250.0, 'tags': ['attack', 'direct-attack']}]"
+                        ),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    learn_from_report(report_path, policy_path)
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["tag_weights"]["attack"] > 0
+    assert policy["tag_weights"]["phase"] < 0
 
 
 def test_learned_policy_contains_version_metadata(tmp_path: Path) -> None:

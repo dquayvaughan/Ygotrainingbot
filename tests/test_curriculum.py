@@ -54,6 +54,7 @@ def test_train_format_curriculum_carries_policy_between_stages(
 
     output_dir = tmp_path / "curriculum-out"
     final_policy = tmp_path / "final-policy.json"
+    initial_policy = tmp_path / "missing-policy.json"
 
     exit_code = main(
         [
@@ -63,6 +64,8 @@ def test_train_format_curriculum_carries_policy_between_stages(
             str(pack_b),
             "--edopro-home",
             str(edopro_home),
+            "--current-policy",
+            str(initial_policy),
             "--output-dir",
             str(output_dir),
             "--promote-to",

@@ -5,3 +5,8 @@ __pycache__/
 .venv/
 node_modules/
 .ygotrain/
+
+# Training run outputs (game logs, brackets, policies from sims)
+data/
+incoming/
+catalog/

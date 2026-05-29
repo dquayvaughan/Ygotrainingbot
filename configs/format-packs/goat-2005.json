@@ -1,9 +1,4 @@
 {
-  "name": "goat-2005",
-  "description": "Representative Goat-era training pack with banlist metadata and topping-style Control/Chaos shells. Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
-  "games": 25,
-  "max_decisions": 60,
-  "banlist_source": "Representative April 2005 Goat-era limits compiled for training metadata.",
   "banlist": {
     "forbidden": [
       58921041,
@@ -41,11 +36,11 @@
       46411259
     ]
   },
+  "banlist_source": "Representative April 2005 Goat-era limits compiled for training metadata.",
   "decks": [
     {
-      "name": "Goat Control representative top shell",
       "archetype": "Goat Control",
-      "source": "Representative Goat Control shell inspired by 2005 topping lists; normalized to card IDs for ocgcore training.",
+      "extra": [],
       "main": [
         72989439,
         77585513,
@@ -87,12 +82,13 @@
         60082869,
         60082869,
         29401950
-      ]
+      ],
+      "name": "Goat Control representative top shell",
+      "source": "Representative Goat Control shell inspired by 2005 topping lists; normalized to card IDs for ocgcore training."
     },
     {
-      "name": "Chaos Warrior representative top shell",
       "archetype": "Chaos Warrior",
-      "source": "Representative Chaos/Warrior shell inspired by 2005 topping lists; normalized to card IDs for ocgcore training.",
+      "extra": [],
       "main": [
         72989439,
         9596126,
@@ -134,7 +130,13 @@
         53582587,
         83555666,
         97077563
-      ]
+      ],
+      "name": "Chaos Warrior representative top shell",
+      "source": "Representative Chaos/Warrior shell inspired by 2005 topping lists; normalized to card IDs for ocgcore training."
     }
-  ]
+  ],
+  "description": "Representative Goat-era training pack with banlist metadata and topping-style Control/Chaos shells. Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
+  "games": 25,
+  "max_decisions": 60,
+  "name": "goat-2005"
 }

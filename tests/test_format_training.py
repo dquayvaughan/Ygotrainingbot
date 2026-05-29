@@ -96,3 +96,4 @@ def test_repository_format_packs_load() -> None:
         pack = load_format_pack(pack_path)
         assert pack.decks
         assert all(len(deck.main) >= 40 for deck in pack.decks)
+        assert all(len(deck.extra) <= 15 for deck in pack.decks)

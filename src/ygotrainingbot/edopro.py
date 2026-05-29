@@ -114,6 +114,7 @@ class EdoproGatewayConfig:
         *,
         working_directory: Path | None = None,
         timeout_seconds: float = 30.0,
+        startup_payload: dict[str, Any] | None = None,
     ) -> "EdoproGatewayConfig":
         if not command:
             raise ValueError("gateway command cannot be empty.")
@@ -121,6 +122,7 @@ class EdoproGatewayConfig:
             command=tuple(command),
             working_directory=working_directory,
             timeout_seconds=timeout_seconds,
+            startup_payload=startup_payload,
         )
 
 
@@ -140,7 +142,17 @@ class JsonLineEdoproSimulator:
     def __init__(self, config: EdoproGatewayConfig) -> None:
         self._config = config
 
-    def play(self, first_player: DuelAgent, second_player: DuelAgent) -> MatchResult:
+    def play(
+        self,
+        first_player: DuelAgent,
+        second_player: DuelAgent,
+        *,
+        deck_a: Sequence[int] | None = None,
+        deck_b: Sequence[int] | None = None,
+        extra_a: Sequence[int] | None = None,
+        extra_b: Sequence[int] | None = None,
+        seed: Sequence[int] | None = None,
+    ) -> MatchResult:
         started_at = time.monotonic()
         process = subprocess.Popen(
             self._config.command,
@@ -156,14 +168,22 @@ class JsonLineEdoproSimulator:
         line_queue = _start_stdout_reader(process)
 
         try:
-            self._send(
-                process,
-                {
-                    "type": "start_duel",
-                    "players": [first_player.name, second_player.name],
-                    **(self._config.startup_payload or {}),
-                },
-            )
+            start_payload: dict[str, Any] = {
+                "type": "start_duel",
+                "players": [first_player.name, second_player.name],
+                **(self._config.startup_payload or {}),
+            }
+            if deck_a is not None:
+                start_payload["deck_a"] = list(deck_a)
+            if deck_b is not None:
+                start_payload["deck_b"] = list(deck_b)
+            if extra_a:
+                start_payload["extra_a"] = list(extra_a)
+            if extra_b:
+                start_payload["extra_b"] = list(extra_b)
+            if seed is not None:
+                start_payload["seed"] = [str(part) for part in seed]
+            self._send(process, start_payload)
             agents = {first_player.name: first_player, second_player.name: second_player}
 
             while True:
@@ -331,7 +351,13 @@ def _result_from_payload(
         turns=int(payload.get("turns", 0)),
         traces=tuple(traces),
         tags=tuple(str(tag) for tag in payload.get("tags", ("edopro",))),
-        metadata={"gateway_logs": tuple(gateway_logs)},
+        metadata={
+            "gateway_logs": tuple(gateway_logs),
+            "end_reason": payload.get("end_reason"),
+            "life_points": payload.get("life_points"),
+            "decisions": payload.get("decisions"),
+            "script_stats": payload.get("script_stats"),
+        },
     )
 
 
