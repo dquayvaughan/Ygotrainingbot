@@ -7,6 +7,43 @@ from pathlib import Path
 from typing import Sequence
 
 
+def read_ydk(path: Path) -> dict[str, tuple[int, ...]]:
+    """Parse an EDOPro .ydk deck file into main, extra, and side card ID lists."""
+
+    section: str | None = None
+    zones: dict[str, list[int]] = {"main": [], "extra": [], "side": []}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            lowered = line.lower()
+            if lowered.startswith("#main"):
+                section = "main"
+            elif lowered.startswith("#extra"):
+                section = "extra"
+            elif lowered.startswith("#side"):
+                section = "side"
+            continue
+        if section is None:
+            continue
+        try:
+            zones[section].append(int(line))
+        except ValueError as exc:
+            raise ValueError(f"invalid card id in {path}: {line!r}") from exc
+    if len(zones["main"]) < 40:
+        raise ValueError(f"{path} main deck must contain at least 40 cards (got {len(zones['main'])}).")
+    if len(zones["main"]) > 60:
+        raise ValueError(f"{path} main deck may contain at most 60 cards (got {len(zones['main'])}).")
+    if len(zones["extra"]) > 15:
+        raise ValueError(f"{path} extra deck may contain at most 15 cards.")
+    if len(zones["side"]) > 15:
+        raise ValueError(f"{path} side deck may contain at most 15 cards.")
+    return {
+        "main": tuple(zones["main"]),
+        "extra": tuple(zones["extra"]),
+        "side": tuple(zones["side"]),
+    }
+
+
 def write_ydk(
     path: Path,
     main: Sequence[int],

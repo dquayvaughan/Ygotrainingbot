@@ -198,11 +198,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     train_pack_parser.add_argument("--games-per-matchup", type=int, default=None)
     train_pack_parser.add_argument("--max-decisions", type=int, default=None)
-    train_pack_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    train_pack_parser.add_argument("--timeout-seconds", type=float, default=300.0)
     train_pack_parser.add_argument("--agent-a-policy", default="heuristic")
     train_pack_parser.add_argument("--agent-b-policy", default="heuristic")
     train_pack_parser.add_argument("--agent-a-weights", type=Path, default=None)
     train_pack_parser.add_argument("--agent-b-weights", type=Path, default=None)
+    train_pack_parser.add_argument(
+        "--deck-a-name",
+        default=None,
+        help="Only run matchups that include this deck as deck A.",
+    )
+    train_pack_parser.add_argument(
+        "--custom-deck-a-file",
+        type=Path,
+        default=None,
+        help="JSON deck list (imported .ydk) to use as deck A.",
+    )
+    train_pack_parser.add_argument(
+        "--deck-b-name",
+        default=None,
+        help="Only run matchups that include this deck as deck B.",
+    )
+    train_pack_parser.add_argument(
+        "--custom-deck-b-file",
+        type=Path,
+        default=None,
+        help="JSON deck list (imported .ydk) to use as deck B.",
+    )
     train_pack_parser.add_argument(
         "--output",
         type=Path,
@@ -723,6 +745,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_b_policy=args.agent_b_policy,
             agent_a_weights=args.agent_a_weights,
             agent_b_weights=args.agent_b_weights,
+            deck_a_name=args.deck_a_name,
+            deck_b_name=args.deck_b_name,
+            custom_deck_a_file=args.custom_deck_a_file,
+            custom_deck_b_file=args.custom_deck_b_file,
         )
     if args.command == "compare-agents":
         return _compare_agents(
@@ -1596,6 +1622,7 @@ def _run_yearly_bracket_report(
                     require_clean_scripts=require_clean_scripts,
                     force_lp_pressure=True,
                     game_log_path=game_log_path,
+                    game_number=game_number,
                     game_meta={**meta, "attempt": attempt + 1, "attempt_seed": list(attempt_seed)},
                 )
                 report["game_number"] = game_number
@@ -1935,16 +1962,19 @@ def _extract_bot_standing(tournament_report: dict[str, object], *, year: int, bo
     }
 
 
-def _deck_zone_parts(deck: object | tuple[int, ...] | None) -> tuple[tuple[int, ...] | None, tuple[int, ...]]:
+def _deck_zone_parts(
+    deck: object | tuple[int, ...] | None,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...], tuple[int, ...]]:
     if deck is None:
-        return None, ()
+        return None, (), ()
     if isinstance(deck, tuple):
-        return deck, ()
+        return deck, (), ()
     main = getattr(deck, "main", None)
     if main is not None:
         extra = tuple(getattr(deck, "extra", ()) or ())
-        return tuple(main), extra
-    return None, ()
+        side = tuple(getattr(deck, "side", ()) or ())
+        return tuple(main), extra, side
+    return None, (), ()
 
 
 def _play_single_duel_report(
@@ -1968,8 +1998,15 @@ def _play_single_duel_report(
     force_lp_pressure: bool = False,
     game_log_path: Path | None = None,
     game_meta: dict[str, object] | None = None,
+    game_number: int = 1,
 ) -> dict[str, object]:
+    from ygotrainingbot.deck_composition import effective_deck_for_bo3_game
     from ygotrainingbot.duel_logs import write_game_log
+
+    if isinstance(deck_a, FormatDeck):
+        deck_a = effective_deck_for_bo3_game(deck_a, game_number)
+    if isinstance(deck_b, FormatDeck):
+        deck_b = effective_deck_for_bo3_game(deck_b, game_number)
 
     config = EdoproGatewayConfig.from_shell_words(
         shlex.split(gateway_command, posix=os.name != "nt"),
@@ -1977,8 +2014,8 @@ def _play_single_duel_report(
         startup_payload={"duel_mode": "mr3"},
     )
     play_kwargs: dict[str, object] = {"seed": seed}
-    main_a, parsed_extra_a = _deck_zone_parts(deck_a)
-    main_b, parsed_extra_b = _deck_zone_parts(deck_b)
+    main_a, parsed_extra_a, parsed_side_a = _deck_zone_parts(deck_a)
+    main_b, parsed_extra_b, parsed_side_b = _deck_zone_parts(deck_b)
     if main_a:
         play_kwargs["deck_a"] = main_a
     if main_b:
@@ -1989,6 +2026,10 @@ def _play_single_duel_report(
         play_kwargs["extra_a"] = resolved_extra_a
     if resolved_extra_b:
         play_kwargs["extra_b"] = resolved_extra_b
+    if parsed_side_a:
+        play_kwargs["side_a"] = parsed_side_a
+    if parsed_side_b:
+        play_kwargs["side_b"] = parsed_side_b
     agent_a = create_agent(agent_a_policy, first_agent, _load_policy_weights(agent_a_weights))
     agent_b = create_agent(agent_b_policy, second_agent, _load_policy_weights(agent_b_weights))
     if force_lp_pressure:
@@ -2548,6 +2589,8 @@ def _collect_edopro_training_report(
     agent_b_weights: Path | None = None,
     games_log_dir: Path | None = None,
     matchup_label: str | None = None,
+    deck_a: object | None = None,
+    deck_b: object | None = None,
 ) -> dict[str, object]:
     if games < 1:
         raise ValueError("games must be at least 1.")
@@ -2572,10 +2615,13 @@ def _collect_edopro_training_report(
             agent_b_policy=agent_b_policy,
             agent_a_weights=agent_a_weights,
             agent_b_weights=agent_b_weights,
+            deck_a=deck_a,
+            deck_b=deck_b,
             seed=(game_index, game_index + 1, game_index + 2, game_index + 3),
             timeout_seconds=timeout_seconds,
             format_name=format_name,
             game_log_path=game_log_path,
+            game_number=game_index,
             game_meta={
                 "format": format_name,
                 "game_number": game_index,
@@ -2661,6 +2707,23 @@ def _train_format(
     )
 
 
+def _load_custom_deck_file(path: Path) -> FormatDeck:
+    from ygotrainingbot.deck_composition import normalize_deck_dict
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    normalized = normalize_deck_dict(payload, modern=True)
+    deck = FormatDeck(
+        name=str(normalized["name"]),
+        main=tuple(normalized["main"]),
+        extra=tuple(normalized.get("extra", [])),
+        side=tuple(normalized.get("side", [])),
+        archetype=str(normalized.get("archetype", "custom")),
+        source="custom-ydk",
+    )
+    deck.validate()
+    return deck
+
+
 def _train_format_pack(
     pack_path: Path,
     *,
@@ -2674,49 +2737,96 @@ def _train_format_pack(
     agent_b_policy: str = "heuristic",
     agent_a_weights: Path | None = None,
     agent_b_weights: Path | None = None,
+    deck_a_name: str | None = None,
+    deck_b_name: str | None = None,
+    custom_deck_a_file: Path | None = None,
+    custom_deck_b_file: Path | None = None,
 ) -> int:
+    from ygotrainingbot.format_matrix import duel_mode_for_pack
+
     pack = load_format_pack(pack_path)
     run_games = games_per_matchup if games_per_matchup is not None else pack.games
     run_max_decisions = max_decisions if max_decisions is not None else pack.max_decisions
+    duel_mode = duel_mode_for_pack(pack)
     matchups: list[dict[str, object]] = []
     total_games = 0
     total_decisions = 0
     aggregate_tags: dict[str, int] = {}
 
     games_log_dir = output.parent / "games" if output else None
-    for first_deck in pack.decks:
-        for second_deck in pack.decks:
-            report = _collect_edopro_training_report(
-                _gateway_command_for_decks(
-                    gateway_script,
-                    edopro_home=edopro_home,
-                    max_decisions=run_max_decisions,
-                    first_deck=first_deck,
-                    second_deck=second_deck,
-                ),
-                games=run_games,
-                first_agent="bot-a",
-                second_agent="bot-b",
-                timeout_seconds=timeout_seconds,
-                format_name=pack.name,
-                agent_a_policy=agent_a_policy,
-                agent_b_policy=agent_b_policy,
-                agent_a_weights=agent_a_weights,
-                agent_b_weights=agent_b_weights,
-                games_log_dir=games_log_dir,
-                matchup_label=f"{first_deck.name}_vs_{second_deck.name}",
-            )
-            total_games += int(report["games"])
-            total_decisions += int(report["traced_decisions"])
-            for tag, count in dict(report["tags"]).items():
-                aggregate_tags[str(tag)] = aggregate_tags.get(str(tag), 0) + int(count)
-            matchups.append(
-                {
-                    "deck_a": first_deck.name,
-                    "deck_b": second_deck.name,
-                    "report": report,
-                }
-            )
+    custom_deck_a = _load_custom_deck_file(custom_deck_a_file) if custom_deck_a_file else None
+    custom_deck_b = _load_custom_deck_file(custom_deck_b_file) if custom_deck_b_file else None
+    if custom_deck_a and custom_deck_b:
+        deck_pairs = [(custom_deck_a, custom_deck_b)]
+    elif custom_deck_a and deck_b_name:
+        deck_pairs = [
+            (custom_deck_a, second_deck)
+            for second_deck in pack.decks
+            if second_deck.name == deck_b_name
+        ]
+    elif custom_deck_a:
+        deck_pairs = [
+            (custom_deck_a, second_deck)
+            for second_deck in pack.decks
+            if second_deck.name != custom_deck_a.name
+        ]
+    elif custom_deck_b and deck_a_name:
+        deck_pairs = [
+            (first_deck, custom_deck_b)
+            for first_deck in pack.decks
+            if first_deck.name == deck_a_name
+        ]
+    elif custom_deck_b:
+        deck_pairs = [
+            (first_deck, custom_deck_b)
+            for first_deck in pack.decks
+            if first_deck.name != custom_deck_b.name
+        ]
+    else:
+        deck_pairs = [
+            (first_deck, second_deck)
+            for first_deck in pack.decks
+            if not deck_a_name or first_deck.name == deck_a_name
+            for second_deck in pack.decks
+            if (not deck_b_name or second_deck.name == deck_b_name)
+            and not (deck_a_name and not deck_b_name and first_deck.name == second_deck.name)
+        ]
+
+    for first_deck, second_deck in deck_pairs:
+        report = _collect_edopro_training_report(
+            _gateway_command_for_decks(
+                gateway_script,
+                edopro_home=edopro_home,
+                max_decisions=run_max_decisions,
+                first_deck=first_deck,
+                second_deck=second_deck,
+                duel_mode=duel_mode,
+            ),
+            games=run_games,
+            first_agent="bot-a",
+            second_agent="bot-b",
+            timeout_seconds=timeout_seconds,
+            format_name=pack.name,
+            agent_a_policy=agent_a_policy,
+            agent_b_policy=agent_b_policy,
+            agent_a_weights=agent_a_weights,
+            agent_b_weights=agent_b_weights,
+            games_log_dir=games_log_dir,
+            matchup_label=f"{first_deck.name}_vs_{second_deck.name}",
+            deck_a=first_deck,
+            deck_b=second_deck,
+        )
+        total_games += int(report["games"])
+        total_decisions += int(report["traced_decisions"])
+        for tag, count in dict(report["tags"]).items():
+            aggregate_tags[str(tag)] = aggregate_tags.get(str(tag), 0) + int(count)
+        matchups.append(
+            {
+                "deck_a": first_deck.name,
+                "deck_b": second_deck.name,
+                "report": report,
+            }
+        )
 
     pack_report = {
         "format": pack.name,

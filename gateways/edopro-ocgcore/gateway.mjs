@@ -1188,18 +1188,29 @@ function parseExtraDeck(value) {
   return parsed;
 }
 
+function parseSideDeck(value) {
+  const parsed = parseDeckList(value, { minimum: 0 });
+  if (parsed.length > 15) {
+    throw new Error("Side deck lists may contain at most 15 card IDs.");
+  }
+  return parsed;
+}
+
 function parsePlayerDecks(message, teamKey, fallbackMain) {
   const deckValue = message[teamKey];
   const extraKey = teamKey === "deck_a" ? "extra_a" : "extra_b";
+  const sideKey = teamKey === "deck_a" ? "side_a" : "side_b";
   if (deckValue && typeof deckValue === "object" && !Array.isArray(deckValue)) {
     return {
       main: parseDeckList(deckValue.main, { minimum: 40, fallback: fallbackMain }),
       extra: parseExtraDeck(deckValue.extra),
+      side: parseSideDeck(deckValue.side),
     };
   }
   return {
     main: parseDeck(deckValue, fallbackMain),
     extra: parseExtraDeck(message[extraKey]),
+    side: parseSideDeck(message[sideKey]),
   };
 }
 
@@ -1382,8 +1393,10 @@ async function main() {
     event: "deck_loaded",
     deck_a_main: decksA.main.length,
     deck_a_extra: decksA.extra.length,
+    deck_a_side: decksA.side.length,
     deck_b_main: decksB.main.length,
     deck_b_extra: decksB.extra.length,
+    deck_b_side: decksB.side.length,
   });
   lib = await createCore({
     sync: true,

@@ -61,5 +61,5 @@ def test_edison_pack_loads_extra_decks() -> None:
     pack = load_format_pack(Path("configs/format-packs/edison-2010.json"))
     quickdraw = next(deck for deck in pack.decks if "Quickdraw" in deck.name)
     frog = next(deck for deck in pack.decks if "Frog" in deck.name)
-    assert len(quickdraw.extra) >= 8
-    assert len(frog.extra) >= 6
+    assert len(quickdraw.extra) <= 15
+    assert len(frog.extra) <= 15

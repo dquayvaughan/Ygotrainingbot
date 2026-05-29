@@ -32,7 +32,7 @@
   },
   "banlist_label": "March 2010 (Edison)",
   "banlist_period": "2010-03",
-  "banlist_source": "Representative March 2010 Edison-era limits compiled for training metadata.",
+  "banlist_source": "TCG March 2010 (Edison) \u2014 representative limits for training metadata.",
   "decks": [
     {
       "archetype": "Quickdraw Dandywarrior",
@@ -423,8 +423,8 @@
       "ygoprodeck_url": "https://ygoprodeck.com/deck/edison-gravekeeper-s-2-484372"
     }
   ],
-  "description": "Representative Edison-era training pack with Quickdraw and Frog Monarch topping-style shells. Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
+  "description": "Top-5 meta deck shells for March 2010 (Edison). Banlist metadata is recorded for analysis; gateway enforcement is a future step.",
   "games": 25,
   "max_decisions": 600,
-  "name": "edison-2010"
+  "name": "banlist-2010-03"
 }

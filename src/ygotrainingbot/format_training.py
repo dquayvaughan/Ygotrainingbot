@@ -39,6 +39,7 @@ class FormatDeck:
     name: str
     main: tuple[int, ...]
     extra: tuple[int, ...] = ()
+    side: tuple[int, ...] = ()
     source: str = ""
     archetype: str = ""
 
@@ -47,8 +48,12 @@ class FormatDeck:
             raise ValueError("format deck requires a name.")
         if len(self.main) < 40:
             raise ValueError(f"deck {self.name!r} must contain at least 40 main deck card IDs.")
+        if len(self.main) > 60:
+            raise ValueError(f"deck {self.name!r} main deck may contain at most 60 cards.")
         if len(self.extra) > 15:
             raise ValueError(f"deck {self.name!r} extra deck may contain at most 15 cards.")
+        if len(self.side) > 15:
+            raise ValueError(f"deck {self.name!r} side deck may contain at most 15 cards.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,4 +175,5 @@ def _format_deck(payload: Any) -> FormatDeck:
         archetype=str(payload.get("archetype", "")),
         main=_card_ids(payload.get("main"), "deck.main"),
         extra=_card_ids_or_empty(payload.get("extra"), "deck.extra"),
+        side=_card_ids_or_empty(payload.get("side"), "deck.side"),
     )

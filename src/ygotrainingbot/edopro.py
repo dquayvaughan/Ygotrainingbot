@@ -151,6 +151,8 @@ class JsonLineEdoproSimulator:
         deck_b: Sequence[int] | None = None,
         extra_a: Sequence[int] | None = None,
         extra_b: Sequence[int] | None = None,
+        side_a: Sequence[int] | None = None,
+        side_b: Sequence[int] | None = None,
         seed: Sequence[int] | None = None,
     ) -> MatchResult:
         started_at = time.monotonic()
@@ -181,6 +183,10 @@ class JsonLineEdoproSimulator:
                 start_payload["extra_a"] = list(extra_a)
             if extra_b:
                 start_payload["extra_b"] = list(extra_b)
+            if side_a:
+                start_payload["side_a"] = list(side_a)
+            if side_b:
+                start_payload["side_b"] = list(side_b)
             if seed is not None:
                 start_payload["seed"] = [str(part) for part in seed]
             self._send(process, start_payload)
