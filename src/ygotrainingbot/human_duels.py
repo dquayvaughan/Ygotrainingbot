@@ -8,8 +8,9 @@ Supported inputs (JSON):
 2. **Decisions-only log** — lighter files for hand-labeled or converted replays with a
    top-level ``decisions`` list instead of full ``traces``.
 
-EDOPro ``.yrp`` / ``.yrpX`` files are not parsed yet; convert those to JSON first
-(see ``data/human-duels/examples/``).
+EDOPro ``.yrp`` / ``.yrpX`` files must be converted first — use
+``python -m ygotrainingbot.cli convert-edopro-replay path/to/replay.yrpX``
+(``.yrpX`` recommended; legacy ``.yrp`` is not supported yet).
 """
 
 from __future__ import annotations
@@ -266,7 +267,15 @@ def build_learning_report(
                 actions[str(action)] += 1
 
     if not all_samples:
-        raise ValueError("No decision samples matched the requested study_agent / format filter")
+        total_decisions = sum(entry.decision_count for entry in entries)
+        if total_decisions == 0:
+            raise ValueError(
+                "Imported replays have no decisions — re-upload .yrpX files or run "
+                "convert-edopro-replay on your EDOPro replay/ folder"
+            )
+        raise ValueError(
+            "No decision samples matched the requested study_agent / format filter"
+        )
 
     format_name = format_filter or entries[0].format
     report: dict[str, Any] = {
@@ -431,9 +440,12 @@ def _load_manifest_entries(catalog_dir: Path) -> list[HumanDuelEntry]:
     for item in duels:
         if not isinstance(item, dict):
             continue
+        duel_id = item.get("duel_id")
+        if not duel_id:
+            continue
         entries.append(
             HumanDuelEntry(
-                duel_id=str(item["duel_id"]),
+                duel_id=str(duel_id),
                 path=str(item["path"]),
                 format=str(item.get("format", "unknown")),
                 study_agent=item.get("study_agent"),

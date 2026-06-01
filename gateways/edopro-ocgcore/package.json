@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node ./gateway.mjs",
-    "smoke": "node ./gateway.mjs --max-decisions 8"
+    "smoke": "node ./smoke-duel.mjs",
+    "smoke-pack": "node ./smoke-pack-duel.mjs",
+    "postinstall": "node ./patch-ocgcore-select.mjs"
   },
   "keywords": [],
   "author": "",

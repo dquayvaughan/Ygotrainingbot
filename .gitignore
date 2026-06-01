@@ -10,3 +10,6 @@ node_modules/
 data/
 incoming/
 catalog/
+
+# Gateway dev scratch output
+gateways/edopro-ocgcore/debug-out*.txt

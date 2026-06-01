@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import traceback
 import threading
 import time
 import uuid
@@ -19,7 +21,9 @@ from urllib.parse import parse_qs, urlparse
 
 from ygotrainingbot.deck_visual import deck_to_visual, find_deck_in_pack, load_card_name_index
 from ygotrainingbot.format_training import load_format_pack
+from ygotrainingbot.gateway_setup import ensure_gateway_dependencies
 from ygotrainingbot.ydk import read_ydk, write_ydk
+from ygotrainingbot.bot_stats import BotStatsPaths, load_bot_stats, rebuild_bot_stats, write_bot_stats
 from ygotrainingbot.human_duels import (
     DEFAULT_CATALOG_DIR,
     build_learning_report,
@@ -27,13 +31,30 @@ from ygotrainingbot.human_duels import (
     import_human_duel_files,
     write_learning_report,
 )
+from ygotrainingbot.replay_convert import prepare_human_upload_files
 from ygotrainingbot.learning import learn_from_report
+from ygotrainingbot.paths import TrainingPaths
 
 DEFAULT_DASHBOARD_MAX_DECISIONS = 600
-DEFAULT_DASHBOARD_TIMEOUT_SECONDS = 300.0
+DEFAULT_DASHBOARD_TIMEOUT_SECONDS = 1200.0
+
+
+def _parse_max_decisions(value: object) -> int:
+    """0 means unlimited (gateway skips the per-duel decision cap)."""
+
+    if value is None or value == "":
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_decisions must be a number (0 = unlimited).") from exc
+    if parsed < 0:
+        raise ValueError("max_decisions cannot be negative.")
+    return parsed
 DEFAULT_ROSTER_PATH = Path("configs/league-rosters/progression-ycs-regionals.json")
 TRAINING_PACK_STEM_DENYLIST = frozenset({"proof-normal-baseline", "edison-2010"})
 DEFAULT_CARD_CACHE = Path("data/cards.json")
+_CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 MONTHS = {
     "january": 1,
     "jan": 1,
@@ -106,13 +127,43 @@ class DashboardSettings:
     """Runtime paths used by the dashboard."""
 
     repo_root: Path
+    data_dir: Path
     jobs_dir: Path
+    bots_dir: Path
+    custom_decks_dir: Path
+    learned_policy_path: Path
+    bracket_output_dir: Path
     edopro_home: Path
     gateway_script: Path
     human_catalog_dir: Path = DEFAULT_CATALOG_DIR
     roster_path: Path = DEFAULT_ROSTER_PATH
     card_cache_path: Path = DEFAULT_CARD_CACHE
     python_executable: str = sys.executable
+
+    @classmethod
+    def from_training_paths(
+        cls,
+        paths: TrainingPaths,
+        *,
+        gateway_script: Path,
+        roster_path: Path = DEFAULT_ROSTER_PATH,
+        python_executable: str = sys.executable,
+    ) -> DashboardSettings:
+        return cls(
+            repo_root=paths.repo_root,
+            data_dir=paths.data_dir,
+            jobs_dir=paths.jobs_dir,
+            bots_dir=paths.bots_dir,
+            custom_decks_dir=paths.custom_decks_dir,
+            learned_policy_path=paths.learned_policy_path,
+            bracket_output_dir=paths.bracket_output_dir,
+            edopro_home=paths.edopro_home,
+            gateway_script=gateway_script,
+            human_catalog_dir=paths.human_catalog_dir,
+            roster_path=roster_path,
+            card_cache_path=paths.card_cache_path,
+            python_executable=python_executable,
+        )
 
 
 @dataclass(slots=True)
@@ -155,6 +206,27 @@ class TrainingJob:
     error: str | None = None
 
 
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Stop a training subprocess and any child processes (e.g. node gateways)."""
+
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 class DashboardState:
     """State and job management for dashboard HTTP handlers."""
 
@@ -162,6 +234,8 @@ class DashboardState:
         self.settings = settings
         self.settings.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._running_processes: dict[str, subprocess.Popen[str]] = {}
+        self._kill_requested: set[str] = set()
 
     def training_bootstrap(self) -> dict[str, object]:
         """Single payload for the dashboard UI (formats, bots, custom decks)."""
@@ -343,9 +417,8 @@ class DashboardState:
         return payload
 
     def _custom_decks_dir(self) -> Path:
-        path = self.settings.jobs_dir.parent / "custom-decks"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        self.settings.custom_decks_dir.mkdir(parents=True, exist_ok=True)
+        return self.settings.custom_decks_dir
 
     def _load_custom_deck(self, deck_id: str) -> dict[str, object]:
         path = self._custom_decks_dir() / f"{deck_id}.json"
@@ -357,9 +430,9 @@ class DashboardState:
         return payload
 
     def _card_names(self) -> dict[int, str]:
-        cache = self.settings.repo_root / self.settings.card_cache_path
+        cache = self.settings.card_cache_path
         if not cache.is_file():
-            cache = self.settings.card_cache_path
+            cache = self.settings.repo_root / self.settings.card_cache_path
         return load_card_name_index(cache if cache.is_file() else None)
 
     def _iter_format_pack_paths(self) -> list[Path]:
@@ -401,7 +474,11 @@ class DashboardState:
                     "description": pack.description,
                     "deck_count": len(pack.decks),
                     "default_games": pack.games,
-                    "default_max_decisions": max(pack.max_decisions, DEFAULT_DASHBOARD_MAX_DECISIONS),
+                    "default_max_decisions": (
+                        pack.max_decisions
+                        if pack.max_decisions > 0
+                        else 0
+                    ),
                     **banlist,
                     "decks": [
                         {
@@ -503,11 +580,9 @@ class DashboardState:
     def start_training(self, payload: dict[str, object]) -> TrainingJob:
         job_kind = str(payload.get("job_kind", "format-pack"))
         games_per_matchup = int(payload.get("games_per_matchup", 5))
-        max_decisions = int(payload.get("max_decisions", DEFAULT_DASHBOARD_MAX_DECISIONS))
+        max_decisions = _parse_max_decisions(payload.get("max_decisions", 0))
         if games_per_matchup < 1:
             raise ValueError("games_per_matchup must be at least 1.")
-        if max_decisions < 100:
-            raise ValueError("max_decisions must be at least 100 for Edison-era decks.")
 
         bot_id = str(payload["bot_id"]) if payload.get("bot_id") else None
         bot_name = None
@@ -570,9 +645,13 @@ class DashboardState:
         if output_dir:
             resolved_output = str(output_dir)
         elif job_kind == "yearly-bracket":
-            resolved_output = self._display_path(Path("data") / f"dashboard-bracket-{job_id[:15]}")
+            resolved_output = self._display_path(
+                self.settings.bracket_output_dir / f"dashboard-bracket-{job_id[:15]}"
+            )
         elif job_kind == "yearly-bracket-loop":
-            resolved_output = self._display_path(Path("data") / f"dashboard-loop-{job_id[:15]}")
+            resolved_output = self._display_path(
+                self.settings.bracket_output_dir / f"dashboard-loop-{job_id[:15]}"
+            )
         else:
             resolved_output = self._display_path(job_dir)
 
@@ -630,6 +709,38 @@ class DashboardState:
             return ""
         return log_path.read_text(encoding="utf-8", errors="replace")
 
+    def duel_log_text(self, job_id: str) -> str:
+        duel_log_path = self._job_dir(job_id) / "duel-live.log"
+        if not duel_log_path.exists():
+            return ""
+        return duel_log_path.read_text(encoding="utf-8", errors="replace")
+
+    def kill_all_jobs(self) -> dict[str, object]:
+        """Terminate every running training subprocess and mark jobs cancelled."""
+
+        killed: list[str] = []
+        with self._lock:
+            for job_id in self._running_processes:
+                self._kill_requested.add(job_id)
+            processes = dict(self._running_processes)
+
+        for job_id, process in processes.items():
+            if process.poll() is None:
+                _terminate_process_tree(process)
+            if job_id not in killed:
+                killed.append(job_id)
+
+        for meta_path in self.settings.jobs_dir.glob("*/meta.json"):
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            job_id = str(data.get("job_id", meta_path.parent.name))
+            if data.get("status") not in {"running", "queued"}:
+                continue
+            if job_id not in killed:
+                killed.append(job_id)
+            self._cancel_job_meta(job_id)
+
+        return {"killed": killed, "count": len(killed)}
+
     def report(self, job_id: str) -> dict[str, object]:
         report_path = self._job_dir(job_id) / "report.json"
         if not report_path.exists():
@@ -646,15 +757,38 @@ class DashboardState:
         catalog_dir = self._human_catalog_dir()
         return catalog_summary(catalog_dir)
 
-    def upload_human_replays(self, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+    def upload_human_replays(
+        self,
+        files: list[tuple[str, bytes]],
+        *,
+        study_agent: str | None = None,
+        format_name: str | None = None,
+    ) -> dict[str, Any]:
         if not files:
-            raise ValueError("upload at least one .json replay file.")
+            raise ValueError("upload at least one replay file (.yrpX, .yrp, or .json).")
 
-        result = import_human_duel_files(files, catalog_dir=self._human_catalog_dir())
+        prepared, convert_errors, converted_count = prepare_human_upload_files(
+            files,
+            study_agent=study_agent or None,
+            format_name=format_name or None,
+        )
+        if not prepared and convert_errors:
+            return {
+                "imported": 0,
+                "skipped": [],
+                "errors": convert_errors,
+                "converted_from_replay": converted_count,
+                "catalog": self.human_catalog(),
+            }
+
+        result = import_human_duel_files(prepared, catalog_dir=self._human_catalog_dir())
+        result.errors.extend(convert_errors)
+        self.refresh_bot_stats()
         return {
             "imported": len(result.imported),
             "skipped": result.skipped,
             "errors": result.errors,
+            "converted_from_replay": converted_count,
             "duels": [
                 {
                     "duel_id": entry.duel_id,
@@ -665,6 +799,7 @@ class DashboardState:
                 for entry in result.imported
             ],
             "catalog": self.human_catalog(),
+            "bot_stats": self.bot_stats(),
         }
 
     def learn_from_human_replays(
@@ -684,6 +819,7 @@ class DashboardState:
         policy_path = self._global_policy_path()
         _analysis, english = learn_from_report(report_path, policy_path)
         summary_path.write_text(english, encoding="utf-8")
+        self.refresh_bot_stats()
         return {
             "report_path": self._display_path(report_path),
             "summary_path": self._display_path(summary_path),
@@ -693,6 +829,7 @@ class DashboardState:
             "format": report.get("format"),
             "bot_agent": report.get("bot_agent"),
             "summary": english,
+            "bot_stats": self.bot_stats(),
         }
 
     def human_learning_summary(self) -> str:
@@ -704,8 +841,57 @@ class DashboardState:
     def human_learning_report(self) -> dict[str, Any]:
         report_path = self._human_catalog_dir() / "human-learning-report.json"
         if not report_path.is_file():
-            raise KeyError("human-learning-report.json")
+            return {
+                "ready": False,
+                "message": "No human replay learning report yet. Upload replays and click Learn.",
+            }
         return json.loads(report_path.read_text(encoding="utf-8"))
+
+    def _bot_stats_paths(self) -> BotStatsPaths:
+        roster = self.settings.roster_path
+        if not roster.is_absolute():
+            roster = (self.settings.repo_root / roster).resolve()
+        catalog = self._human_catalog_dir()
+        return BotStatsPaths(
+            repo_root=self.settings.repo_root,
+            jobs_dir=self.settings.jobs_dir,
+            bots_dir=self.settings.bots_dir,
+            human_catalog_dir=catalog,
+            roster_path=roster,
+            stats_path=self.settings.data_dir / "bot-training-stats.json",
+        )
+
+    def refresh_bot_stats(self) -> dict[str, Any]:
+        return self.persist_bot_stats()
+
+    def bot_stats(self, *, refresh: bool = False) -> dict[str, Any]:
+        paths = self._bot_stats_paths()
+        if refresh:
+            snapshot = rebuild_bot_stats(paths)
+            try:
+                write_bot_stats(paths)
+                return load_bot_stats(paths.stats_path)
+            except OSError:
+                return snapshot
+        if paths.stats_path.is_file():
+            cached = load_bot_stats(paths.stats_path)
+            if cached.get("updated_at") is not None:
+                return cached
+        snapshot = rebuild_bot_stats(paths)
+        try:
+            write_bot_stats(paths)
+        except OSError:
+            pass
+        return snapshot
+
+    def persist_bot_stats(self) -> dict[str, Any]:
+        paths = self._bot_stats_paths()
+        snapshot = rebuild_bot_stats(paths)
+        try:
+            write_bot_stats(paths)
+            return load_bot_stats(paths.stats_path)
+        except OSError:
+            return snapshot
 
     def _human_catalog_dir(self) -> Path:
         path = self.settings.human_catalog_dir
@@ -715,41 +901,76 @@ class DashboardState:
         return path
 
     def _run_job(self, job: TrainingJob) -> None:
+        import os
+
         job_dir = self._job_dir(job.job_id)
         log_path = job_dir / "training.log"
+        duel_log_path = job_dir / "duel-live.log"
         report_path = job_dir / "report.json"
 
         try:
             job.status = "running"
             job.started_at = time.time()
             self._write_job(job)
+            duel_log_path.write_text(
+                f"[{time.strftime('%H:%M:%S')}] Training job {job.job_id} started ({job.label})\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["YGOTRAIN_DUEL_LIVE_LOG"] = str(duel_log_path.resolve())
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
             with log_path.open("a", encoding="utf-8") as log:
                 self._ensure_gateway_dependencies(log)
                 self._ensure_edopro_home(log)
                 command = self._build_cli_command(job, report_path=report_path)
                 log.write("$ " + " ".join(command) + "\n")
                 log.flush()
-                process = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     cwd=self.settings.repo_root,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    check=False,
+                    env=env,
                 )
-                job.returncode = process.returncode
-                if process.returncode == 0:
-                    self._post_process_job(job, report_path=report_path, job_dir=job_dir, log=log)
-                    job.status = "completed"
-                else:
-                    job.status = "failed"
+                with self._lock:
+                    self._running_processes[job.job_id] = process
+                cancelled = False
+                while process.poll() is None:
+                    if job.job_id in self._kill_requested:
+                        _terminate_process_tree(process)
+                        job.status = "cancelled"
+                        job.error = "Stopped by user"
+                        job.returncode = -1
+                        log.write("\nJob stopped by user (kill all).\n")
+                        log.flush()
+                        cancelled = True
+                        break
+                    time.sleep(0.25)
+                if not cancelled:
+                    job.returncode = process.returncode
+                    if process.returncode == 0:
+                        self._post_process_job(job, report_path=report_path, job_dir=job_dir, log=log)
+                        job.status = "completed"
+                    else:
+                        job.status = "failed"
         except Exception as exc:  # pragma: no cover - defensive job boundary
             job.status = "failed"
             job.error = str(exc)
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(f"\nERROR: {exc}\n")
         finally:
+            with self._lock:
+                self._running_processes.pop(job.job_id, None)
+                self._kill_requested.discard(job.job_id)
             job.finished_at = time.time()
+            if duel_log_path.exists():
+                with duel_log_path.open("a", encoding="utf-8") as duel_log:
+                    duel_log.write(
+                        f"\n[{time.strftime('%H:%M:%S')}] Job finished: status={job.status}"
+                        f"{f', error={job.error}' if job.error else ''}\n",
+                    )
             self._write_job(job)
 
     def _build_cli_command(self, job: TrainingJob, *, report_path: Path) -> list[str]:
@@ -931,8 +1152,13 @@ class DashboardState:
                 learn_target.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-            log.write("\n$ updated .ygotrain/learned-policy.json\n")
+            log.write(f"\n$ updated {self._display_path(self._global_policy_path())}\n")
         log.write("\n$ generated learning-summary.txt\n")
+        try:
+            self.persist_bot_stats()
+            log.write("\n$ refreshed bot-training-stats.json\n")
+        except Exception as exc:  # pragma: no cover - stats must not fail jobs
+            log.write(f"\n$ bot stats refresh skipped: {exc}\n")
 
     def _job_label(
         self,
@@ -1023,23 +1249,10 @@ class DashboardState:
         raise ValueError(f"cannot initialize policy for {bot_id}")
 
     def _bot_policy_path(self, bot_id: str) -> Path:
-        return self.settings.jobs_dir.parent / "bots" / bot_id / "policy.json"
+        return self.settings.bots_dir / bot_id / "policy.json"
 
     def _ensure_gateway_dependencies(self, log: Any) -> None:
-        node_modules = self.settings.repo_root / "gateways/edopro-ocgcore/node_modules"
-        if node_modules.exists():
-            return
-        command = ["npm", "ci", "--prefix", "gateways/edopro-ocgcore"]
-        log.write("$ " + " ".join(command) + "\n")
-        log.flush()
-        subprocess.run(
-            command,
-            cwd=self.settings.repo_root,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
+        ensure_gateway_dependencies(self.settings.repo_root, log=log)
 
     def _ensure_edopro_home(self, log: Any) -> None:
         if (self.settings.edopro_home / "cards.cdb").exists():
@@ -1071,7 +1284,7 @@ class DashboardState:
         return self.settings.jobs_dir / job_id
 
     def _global_policy_path(self) -> Path:
-        return self.settings.jobs_dir.parent / "learned-policy.json"
+        return self.settings.learned_policy_path
 
     def _display_path(self, path: Path) -> str:
         try:
@@ -1088,6 +1301,28 @@ class DashboardState:
             meta_path = self._job_dir(job.job_id) / "meta.json"
             meta_path.write_text(json.dumps(asdict(job), indent=2, sort_keys=True), encoding="utf-8")
 
+    def _cancel_job_meta(self, job_id: str, *, error: str = "Stopped by user") -> None:
+        meta_path = self._job_dir(job_id) / "meta.json"
+        if not meta_path.exists():
+            return
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        if data.get("status") not in {"running", "queued"}:
+            return
+        data["status"] = "cancelled"
+        data["error"] = error
+        data["finished_at"] = time.time()
+        data["returncode"] = -1
+        meta_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        job_dir = meta_path.parent
+        duel_log_path = job_dir / "duel-live.log"
+        if duel_log_path.exists():
+            with duel_log_path.open("a", encoding="utf-8") as duel_log:
+                duel_log.write(f"\n[{time.strftime('%H:%M:%S')}] Job cancelled: {error}\n")
+        log_path = job_dir / "training.log"
+        if log_path.exists():
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(f"\nJob cancelled: {error}\n")
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP routes for the dashboard UI and JSON API."""
@@ -1098,6 +1333,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             self._handle_get()
         except Exception as exc:  # pragma: no cover - HTTP safety net
+            self._log_handler_error("GET", exc)
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -1106,6 +1342,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # pragma: no cover - HTTP safety net
+            self._log_handler_error("POST", exc)
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -1171,8 +1408,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_text(self.state.human_learning_summary())
         elif path == "/api/human-duels/report":
             self._send_json(self.state.human_learning_report())
+        elif path == "/api/bot-stats":
+            query = parse_qs(urlparse(self.path).query)
+            refresh = (query.get("refresh") or ["0"])[0] in {"1", "true", "yes"}
+            self._send_json(self.state.bot_stats(refresh=refresh))
         elif path == "/api/jobs":
             self._send_json({"jobs": self.state.jobs()})
+        elif path.startswith("/api/jobs/") and path.endswith("/duel-log"):
+            job_id = path.split("/")[3]
+            self._send_text(self.state.duel_log_text(job_id))
         elif path.startswith("/api/jobs/") and path.endswith("/log"):
             job_id = path.split("/")[3]
             self._send_text(self.state.log_text(job_id))
@@ -1190,13 +1434,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_post(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/jobs/kill-all":
+            self._send_json(self.state.kill_all_jobs())
+            return
         if path == "/api/jobs":
             payload = self._read_json()
             if payload.get("pack") and not payload.get("job_kind"):
                 job = self.state.start_job(
                     pack_path=str(payload.get("pack", "")),
                     games_per_matchup=int(payload.get("games_per_matchup", 5)),
-                    max_decisions=int(payload.get("max_decisions", DEFAULT_DASHBOARD_MAX_DECISIONS)),
+                    max_decisions=_parse_max_decisions(payload.get("max_decisions", 0)),
                 )
             else:
                 job = self.state.start_training(payload)
@@ -1218,8 +1465,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"deck": payload, "custom_decks": self.state.list_custom_decks(bot_id=bot_id)}, status=HTTPStatus.CREATED)
             return
         if path == "/api/human-duels/upload":
-            files = self._read_upload_files()
-            payload = self.state.upload_human_replays(files)
+            fields, files = self._read_multipart_form()
+            if not files:
+                raise ValueError("choose at least one replay file (.yrpX, .yrp, or .json).")
+            payload = self.state.upload_human_replays(
+                files,
+                study_agent=fields.get("study_agent") or None,
+                format_name=fields.get("format") or None,
+            )
             status = HTTPStatus.CREATED if payload["imported"] else HTTPStatus.BAD_REQUEST
             self._send_json(payload, status=status)
             return
@@ -1259,29 +1512,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("upload requests must use multipart/form-data.")
         return _parse_multipart_files(body, content_type)
 
+    def _log_handler_error(self, method: str, exc: BaseException) -> None:
+        path = urlparse(self.path).path
+        print(f"dashboard {method} {path} failed: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
+    def _write_response_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+
     def _send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+        self._write_response_body(body)
 
     def _send_html(self, html: str) -> None:
         body = html.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+        self._write_response_body(body)
 
     def _send_text(self, text: str) -> None:
         body = text.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+        self._write_response_body(body)
 
 
 def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, str], list[tuple[str, bytes]]]:
@@ -1331,12 +1604,7 @@ def _parse_multipart_files(body: bytes, content_type: str) -> list[tuple[str, by
     """Parse uploaded files from a multipart/form-data body."""
 
     _, files = _parse_multipart_form(body, content_type)
-    replay_files: list[tuple[str, bytes]] = []
-    for filename, data in files:
-        if not filename.lower().endswith(".json"):
-            raise ValueError(f"only .json replay files are supported (got {filename!r}).")
-        replay_files.append((filename, data))
-    return replay_files
+    return list(files)
 
 
 def _detect_repo_root(start: Path | None = None) -> Path:
@@ -1352,22 +1620,28 @@ def run_dashboard(
     host: str = "127.0.0.1",
     port: int = 8765,
     repo_root: Path | None = None,
+    data_dir: Path | None = None,
     edopro_home: Path | None = None,
     human_catalog_dir: Path | None = None,
 ) -> None:
     """Run the training dashboard HTTP server."""
 
     root = _detect_repo_root(repo_root)
-    settings = DashboardSettings(
-        repo_root=root,
-        jobs_dir=root / ".ygotrain/jobs",
-        edopro_home=edopro_home or Path("/tmp/ygotrain/edopro-home"),
+    paths = TrainingPaths.resolve(
+        root,
+        data_dir=data_dir,
+        edopro_home=edopro_home,
+        human_catalog_dir=human_catalog_dir,
+    )
+    paths.ensure_directories()
+    settings = DashboardSettings.from_training_paths(
+        paths,
         gateway_script=root / "gateways/edopro-ocgcore/gateway.mjs",
-        human_catalog_dir=human_catalog_dir or DEFAULT_CATALOG_DIR,
     )
     DashboardHandler.state = DashboardState(settings)
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"YGO Training Console at http://{host}:{port}")
+    print(f"Training data: {paths.data_dir}")
     print("Modes: bot spar, format pack, yearly bracket, bracket loop, format matrix")
     server.serve_forever()
 
@@ -1376,14 +1650,20 @@ def main() -> int:
     """Console entry point for the dashboard."""
 
     parser = argparse.ArgumentParser(prog="ygotrain-dashboard")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default=os.environ.get("YGOTRAIN_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--edopro-home", type=Path, default=Path(".ygotrain/edopro-home"))
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Persistent training root (jobs, bots, policies). Defaults to YGOTRAIN_DATA_DIR or .ygotrain/",
+    )
+    parser.add_argument("--edopro-home", type=Path, default=None)
     parser.add_argument(
         "--human-catalog-dir",
         type=Path,
-        default=DEFAULT_CATALOG_DIR,
+        default=None,
         help="Directory for imported human replay JSON logs.",
     )
     args = parser.parse_args()
@@ -1391,6 +1671,7 @@ def main() -> int:
         host=args.host,
         port=args.port,
         repo_root=args.repo_root,
+        data_dir=args.data_dir,
         edopro_home=args.edopro_home,
         human_catalog_dir=args.human_catalog_dir,
     )
@@ -1404,171 +1685,279 @@ DASHBOARD_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>YGO Training Console</title>
   <style>
-    :root { color-scheme: dark; --bg:#0f172a; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#ef4444; --panel:#111827; }
+    :root { color-scheme: dark; --bg:#0f172a; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#ef4444; --warn:#f59e0b; --panel:#111827; --line:rgba(148,163,184,.18); }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#020617,var(--bg)); color:var(--text); }
-    header { padding:20px 18px 6px; max-width:1280px; margin:0 auto; }
-    h1 { margin:0 0 4px; font-size:26px; }
-    h2 { margin:0 0 12px; font-size:18px; }
-    .sub { color:var(--muted); margin:0; line-height:1.45; }
-    main { display:grid; gap:16px; padding:16px; max-width:1280px; margin:0 auto; }
-    section { background:rgba(17,24,39,.94); border:1px solid rgba(148,163,184,.18); border-radius:16px; padding:16px; }
-    label { display:block; color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; margin:10px 0 6px; }
-    select,input,button { width:100%; border-radius:10px; border:1px solid rgba(148,163,184,.25); padding:10px 12px; background:#020617; color:var(--text); font-size:15px; }
-    button.primary { background:var(--accent); color:#082f49; border:0; font-weight:800; cursor:pointer; margin-top:14px; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#020617,var(--bg)); color:var(--text); min-height:100vh; }
+    header { padding:16px 18px 0; max-width:1400px; margin:0 auto; display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:22px; }
+    h2 { margin:0 0 10px; font-size:15px; text-transform:uppercase; letter-spacing:.06em; color:var(--accent); }
+    .sub { color:var(--muted); margin:0; line-height:1.45; font-size:13px; }
+    main { display:flex; flex-direction:column; gap:14px; padding:14px 18px 24px; max-width:1400px; margin:0 auto; }
+    section, .panel { background:rgba(17,24,39,.94); border:1px solid var(--line); border-radius:14px; padding:14px; }
+    label { display:block; color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; margin:0 0 6px; }
+    select,input,button { width:100%; border-radius:10px; border:1px solid rgba(148,163,184,.25); padding:10px 12px; background:#020617; color:var(--text); font-size:14px; }
+    button.primary { background:var(--accent); color:#082f49; border:0; font-weight:800; cursor:pointer; }
+    button.secondary { background:#334155; color:var(--text); border:0; font-weight:700; cursor:pointer; }
     button:disabled { opacity:.55; cursor:wait; }
-    .cols-2 { display:grid; gap:12px; grid-template-columns:1fr 1fr; }
-    .cols-3 { display:grid; gap:12px; grid-template-columns:repeat(3,1fr); }
-    .mode-grid { display:grid; gap:8px; margin-top:4px; }
-    .mode { display:flex; gap:10px; align-items:flex-start; padding:10px; border:1px solid rgba(148,163,184,.2); border-radius:10px; cursor:pointer; background:#020617; }
-    .mode:has(input:checked) { border-color:var(--accent); background:rgba(56,189,248,.08); }
-    .mode input { width:auto; margin-top:3px; }
-    .mode strong { display:block; font-size:14px; }
-    .mode span { color:var(--muted); font-size:12px; line-height:1.35; }
     .hidden { display:none !important; }
-    .job { border:1px solid rgba(148,163,184,.16); border-radius:12px; padding:12px; margin-top:8px; background:#020617; cursor:pointer; }
+    a { color:var(--accent); }
+
+    .top-bar { display:grid; grid-template-columns:minmax(200px,280px) minmax(180px,240px) 1fr; gap:14px; align-items:end; }
+    .mode-hint { margin:0; color:var(--muted); font-size:13px; line-height:1.5; padding:10px 12px; background:#020617; border:1px solid var(--line); border-radius:10px; min-height:42px; }
+
+    .bot-row { display:grid; grid-template-columns:1fr 1fr; gap:14px; min-height:420px; }
+    .bot-panel { display:flex; flex-direction:column; gap:10px; min-height:0; }
+    .bot-meta { color:var(--muted); font-size:12px; margin:4px 0 0; line-height:1.4; }
+    .import-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:end; }
+    .import-row input[type=file] { font-size:12px; padding:8px; }
+    .deck-preview-box { flex:1; min-height:180px; overflow:auto; border:1px solid var(--line); border-radius:10px; padding:10px; background:#020617; }
+    .preview-empty { color:var(--muted); font-size:13px; text-align:center; padding:24px 12px; }
+
+    .bottom-stage { min-height:320px; display:flex; flex-direction:column; gap:14px; }
+    .stage-toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:end; }
+    .stage-toolbar > div { flex:1; min-width:140px; }
+    .stage-body { flex:1; min-height:160px; border:1px dashed rgba(148,163,184,.25); border-radius:12px; padding:14px; background:#020617; overflow:auto; }
+    .stage-title { margin:0 0 8px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+    .stage-split { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    @media (max-width:960px) { .stage-split { grid-template-columns:1fr; } }
+
+    .meta-deck-grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(120px, 1fr)); }
+    .meta-deck-card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px; cursor:pointer; transition:border-color .15s; }
+    .meta-deck-card:hover, .meta-deck-card.selected { border-color:var(--accent); }
+    .meta-deck-card img { width:100%; border-radius:6px; aspect-ratio:59/86; object-fit:cover; background:#1e293b; }
+    .meta-deck-card strong { display:block; font-size:11px; margin-top:6px; line-height:1.25; }
+    .meta-deck-card span { color:var(--muted); font-size:10px; }
+
+    .card-grid { display:grid; gap:6px; grid-template-columns:repeat(auto-fill, minmax(56px, 1fr)); margin-top:6px; }
+    .card-tile { background:var(--panel); border:1px solid rgba(148,163,184,.12); border-radius:6px; padding:3px; text-align:center; position:relative; }
+    .card-tile img { width:100%; border-radius:4px; display:block; }
+    .card-tile .count { position:absolute; top:3px; right:3px; background:rgba(15,23,42,.92); color:var(--accent); font-size:9px; font-weight:800; padding:1px 4px; border-radius:999px; }
+    .card-tile .label { font-size:8px; color:var(--muted); margin-top:2px; line-height:1.15; max-height:2.3em; overflow:hidden; }
+    .zone-title { font-size:10px; color:var(--muted); margin:10px 0 2px; text-transform:uppercase; letter-spacing:.04em; }
+
+    .bracket-placeholder { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:8px; }
+    .bracket-col { border:1px solid var(--line); border-radius:10px; padding:10px; min-height:120px; }
+    .bracket-col h3 { margin:0 0 8px; font-size:12px; color:var(--accent); }
+    .bracket-slot { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px; margin-bottom:6px; font-size:12px; color:var(--muted); }
+
+    .job { border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:6px; background:var(--panel); cursor:pointer; }
     .job:hover { border-color:rgba(56,189,248,.35); }
-    .status { display:inline-block; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:800; background:#334155; }
+    .status { display:inline-block; padding:2px 7px; border-radius:999px; font-size:10px; font-weight:800; background:#334155; }
+    .status.running { background:rgba(56,189,248,.2); color:var(--accent); }
+    .status.cancelled { background:rgba(245,158,11,.2); color:var(--warn); }
+    button.danger { background:var(--bad); color:#fff; border:0; font-weight:700; cursor:pointer; padding:6px 12px; border-radius:8px; font-size:12px; }
+    button.danger:disabled { opacity:0.5; cursor:not-allowed; }
     .completed { background:rgba(34,197,94,.18); color:var(--ok); }
     .failed { background:rgba(239,68,68,.18); color:var(--bad); }
     .running,.queued { background:rgba(56,189,248,.18); color:var(--accent); }
-    pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:420px; overflow:auto; background:#020617; border-radius:10px; padding:12px; border:1px solid rgba(148,163,184,.16); font-size:12px; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#1e293b; color:var(--muted); margin-right:6px; }
-    .bot-meta { color:var(--muted); font-size:13px; margin-top:4px; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:280px; overflow:auto; background:#020617; border-radius:10px; padding:10px; border:1px solid var(--line); font-size:11px; margin:0; }
+    .pill { display:inline-block; padding:2px 7px; border-radius:999px; font-size:10px; background:#1e293b; color:var(--muted); margin-right:4px; }
     .hint { color:var(--muted); font-size:12px; line-height:1.45; margin:4px 0 0; }
-    .group-label { margin:16px 0 8px; font-size:13px; color:var(--accent); text-transform:uppercase; letter-spacing:.06em; }
-    .meta-deck-grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); margin-top:8px; }
-    .meta-deck-card { background:#020617; border:1px solid rgba(148,163,184,.18); border-radius:12px; padding:10px; cursor:pointer; transition:border-color .15s; }
-    .meta-deck-card:hover, .meta-deck-card.selected { border-color:var(--accent); }
-    .meta-deck-card img { width:100%; border-radius:8px; aspect-ratio:59/86; object-fit:cover; background:#1e293b; }
-    .meta-deck-card strong { display:block; font-size:12px; margin-top:8px; line-height:1.3; }
-    .meta-deck-card span { color:var(--muted); font-size:11px; }
-    .deck-preview { margin-top:12px; }
-    .card-grid { display:grid; gap:8px; grid-template-columns:repeat(auto-fill, minmax(64px, 1fr)); margin-top:8px; }
-    .card-tile { background:#020617; border:1px solid rgba(148,163,184,.12); border-radius:8px; padding:4px; text-align:center; position:relative; }
-    .card-tile img { width:100%; border-radius:6px; display:block; }
-    .card-tile .count { position:absolute; top:4px; right:4px; background:rgba(15,23,42,.92); color:var(--accent); font-size:10px; font-weight:800; padding:2px 5px; border-radius:999px; }
-    .card-tile .label { font-size:9px; color:var(--muted); margin-top:3px; line-height:1.2; max-height:2.4em; overflow:hidden; }
-    .zone-title { font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
-    #message { min-height:1.2em; font-size:13px; margin-top:10px; }
-    a { color:var(--accent); }
-    @media (max-width:800px) { .cols-2,.cols-3 { grid-template-columns:1fr; } }
-    @media (min-width:960px) { .layout { grid-template-columns:420px 1fr; } }
-    .layout { display:grid; gap:16px; }
+    #message { min-height:1.2em; font-size:13px; margin:0; }
+
+    .stats-table { width:100%; border-collapse:collapse; font-size:14px; margin-top:10px; }
+    .stats-table th, .stats-table td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(148,163,184,.14); }
+    .stats-table th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    .stats-table tr:hover td { background:rgba(56,189,248,.06); }
+    .stats-updated { font-size:13px; color:var(--muted); margin:0 0 8px; }
+    @media (max-width:900px) {
+      .top-bar { grid-template-columns:1fr; }
+      .bot-row { grid-template-columns:1fr; }
+      .stats-table { font-size:12px; }
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>YGO Training Console</h1>
-    <p class="sub">Pick a banlist date, choose who fights who, and launch training jobs. <a href="/replays">Human replays →</a></p>
+    <p class="sub"><a href="/replays">Human replays →</a></p>
   </header>
-  <main class="layout">
-    <section>
-      <h2>Launch training</h2>
 
-      <div id="match-setup">
-        <p class="group-label">Banlist &amp; decks</p>
-        <div id="banlist-block">
-          <label for="banlist">Banlist effective date</label>
-          <select id="banlist"></select>
-          <p class="hint" id="banlist-hint">Format rules come from the banlist — decks below are legal meta shells for that era.</p>
+  <main>
+    <section id="bot-stats-section">
+      <h2>Bot training stats</h2>
+      <p class="stats-updated" id="bot-stats-updated">Loading…</p>
+      <div style="overflow-x:auto;">
+        <table class="stats-table" id="bot-stats-table">
+          <thead>
+            <tr>
+              <th>Bot</th>
+              <th>Training duels</th>
+              <th>Human duels</th>
+              <th>Sessions</th>
+              <th>Policy updates</th>
+              <th>Avg turns</th>
+              <th>Avg actions</th>
+              <th>Last trained</th>
+            </tr>
+          </thead>
+          <tbody id="bot-stats-body"><tr><td colspan="8">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="top-bar">
+      <div id="banlist-block">
+        <label for="banlist">Banlist / format</label>
+        <select id="banlist"></select>
+      </div>
+      <div>
+        <label for="mode-select">Training mode</label>
+        <select id="mode-select">
+          <option value="bot-spar">Focused duel</option>
+          <option value="format-pack">Meta sweep</option>
+          <option value="yearly-bracket">Full season (2010–2025)</option>
+          <option value="yearly-bracket-loop">Single-year drill</option>
+          <option value="format-matrix">Gateway health check</option>
+        </select>
+      </div>
+      <div>
+        <label>Mode guide</label>
+        <p class="mode-hint" id="mode-hint">Pick a banlist, configure both bots below, then launch from the bottom panel.</p>
+      </div>
+    </section>
+
+    <div class="bot-row" id="bot-row">
+      <section class="bot-panel" id="bot-panel-train">
+        <h2>Bot 1 — to train</h2>
+        <div>
+          <label for="bot">Bot</label>
+          <select id="bot"></select>
+          <p class="bot-meta" id="bot-meta">—</p>
         </div>
-
-        <div id="meta-gallery-wrap">
-          <p class="group-label">Top 5 meta decks (this banlist)</p>
-          <div id="meta-deck-grid" class="meta-deck-grid"></div>
+        <div id="train-deck-block">
+          <label for="deck">Deck</label>
+          <select id="deck"></select>
         </div>
-
-        <div class="cols-2">
-          <div>
-            <label for="bot">Bot to train</label>
-            <select id="bot"></select>
-            <p class="bot-meta" id="bot-meta">—</p>
-          </div>
-          <div id="opponent-bot-wrap">
-            <label for="opponent-bot">Bot to train against</label>
-            <select id="opponent-bot"></select>
-            <p class="bot-meta" id="opponent-meta">—</p>
-          </div>
-        </div>
-
-        <div class="cols-2" id="deck-pickers">
-          <div>
-            <label for="deck">Your bot's deck</label>
-            <select id="deck"></select>
-          </div>
-          <div>
-            <label for="opponent-deck">Opponent deck</label>
-            <select id="opponent-deck"></select>
-          </div>
-        </div>
-
-        <div id="ydk-import">
-          <label>Import custom deck (.ydk) for your bot</label>
-          <div class="cols-2">
-            <input id="ydk-name" type="text" placeholder="Deck name (optional)" />
+        <div id="train-import-block">
+          <label>Import .ydk</label>
+          <div class="import-row">
             <input id="ydk-file" type="file" accept=".ydk" />
+            <button type="button" class="secondary" id="import-ydk">Import</button>
           </div>
-          <button type="button" id="import-ydk" style="margin-top:8px;">Import .ydk for bot to train</button>
+          <input id="ydk-name" type="text" placeholder="Deck name (optional)" style="margin-top:8px;" />
         </div>
-      </div>
+        <div class="deck-preview-box" id="train-preview-box">
+          <p class="preview-empty" id="train-preview-empty">Select a deck to preview cards.</p>
+          <div id="train-preview-content" class="hidden">
+            <span class="pill" id="preview-title-train"></span>
+            <p class="zone-title">Main</p>
+            <div id="preview-main-train" class="card-grid"></div>
+            <p class="zone-title" id="preview-extra-label-train">Extra</p>
+            <div id="preview-extra-train" class="card-grid"></div>
+            <p class="zone-title" id="preview-side-label-train">Side</p>
+            <div id="preview-side-train" class="card-grid"></div>
+          </div>
+        </div>
+      </section>
 
-      <div id="deck-preview" class="deck-preview hidden">
-        <p class="group-label">Deck preview <span id="preview-title" class="pill"></span></p>
-        <p class="zone-title">Main deck</p>
-        <div id="preview-main" class="card-grid"></div>
-        <p class="zone-title" id="preview-extra-label">Extra deck</p>
-        <div id="preview-extra" class="card-grid"></div>
-        <p class="zone-title" id="preview-side-label">Side deck (Bo3)</p>
-        <div id="preview-side" class="card-grid"></div>
-      </div>
+      <section class="bot-panel" id="bot-panel-opponent">
+        <h2>Bot 2 — train against</h2>
+        <div id="opponent-bot-wrap">
+          <label for="opponent-bot">Bot</label>
+          <select id="opponent-bot"></select>
+          <p class="bot-meta" id="opponent-meta">—</p>
+        </div>
+        <div id="opponent-deck-block">
+          <label for="opponent-deck">Deck</label>
+          <select id="opponent-deck"></select>
+        </div>
+        <div id="opponent-import-block">
+          <label>Import .ydk</label>
+          <div class="import-row">
+            <input id="opponent-ydk-file" type="file" accept=".ydk" />
+            <button type="button" class="secondary" id="import-opponent-ydk">Import</button>
+          </div>
+          <input id="opponent-ydk-name" type="text" placeholder="Deck name (optional)" style="margin-top:8px;" />
+        </div>
+        <div class="deck-preview-box" id="opponent-preview-box">
+          <p class="preview-empty" id="opponent-preview-empty">Select a deck to preview cards.</p>
+          <div id="opponent-preview-content" class="hidden">
+            <span class="pill" id="preview-title-opponent"></span>
+            <p class="zone-title">Main</p>
+            <div id="preview-main-opponent" class="card-grid"></div>
+            <p class="zone-title" id="preview-extra-label-opponent">Extra</p>
+            <div id="preview-extra-opponent" class="card-grid"></div>
+            <p class="zone-title" id="preview-side-label-opponent">Side</p>
+            <div id="preview-side-opponent" class="card-grid"></div>
+          </div>
+        </div>
+      </section>
+    </div>
 
-      <p class="group-label">Training mode</p>
-      <div class="mode-grid">
-        <label class="mode"><input type="radio" name="mode" value="bot-spar" checked /><div><strong>Focused duel</strong><span>Your bot plays N games vs one opponent (bot + deck). Only your bot's policy is updated from the results.</span></div></label>
-        <label class="mode"><input type="radio" name="mode" value="format-pack" /><div><strong>Meta sweep</strong><span>Run every meta deck vs every other meta deck at this banlist. Updates the shared global policy, not a single bot.</span></div></label>
-        <label class="mode"><input type="radio" name="mode" value="yearly-bracket" /><div><strong>Full season (2010–2025)</strong><span>Simulates the entire yearly bracket: your bot faces every roster opponent with era decks. All bots learn between rounds.</span></div></label>
-        <label class="mode"><input type="radio" name="mode" value="yearly-bracket-loop" /><div><strong>Single-year drill</strong><span>Replay one calendar year multiple times with learning between cycles — grind one meta before moving on.</span></div></label>
-        <label class="mode"><input type="radio" name="mode" value="format-matrix" /><div><strong>Gateway health check</strong><span>Quick smoke test that EDOPro can finish duels at this banlist. Almost no learning — use to verify setup.</span></div></label>
-      </div>
-
-      <div id="spar-settings" class="cols-2">
+    <section class="bottom-stage">
+      <div id="stage-spar" class="stage-toolbar">
         <div><label for="games">Games per matchup</label><input id="games" type="number" min="1" value="10" /></div>
-        <div><label for="decisions">Max decisions per game</label><input id="decisions" type="number" min="100" value="600" /></div>
+        <div><label for="decisions">Max decisions / game (0 = unlimited)</label><input id="decisions" type="number" min="0" value="0" /></div>
+        <div style="flex:0 0 auto; min-width:180px;"><label>&nbsp;</label><button class="primary" id="start">Start training job</button></div>
       </div>
 
-      <div id="bracket-settings" class="hidden">
-        <div class="cols-2">
+      <div id="stage-meta" class="hidden">
+        <p class="stage-title">Meta sweep — all deck pairings at this banlist</p>
+        <div id="meta-deck-grid" class="meta-deck-grid"></div>
+        <p class="hint" style="margin-top:10px;">Runs every top meta deck vs every other. Updates the shared global policy.</p>
+        <button class="primary" id="start-meta" style="margin-top:12px; max-width:280px;">Start meta sweep</button>
+      </div>
+
+      <div id="stage-bracket" class="hidden">
+        <p class="stage-title">Full season bracket</p>
+        <div class="cols-2" style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
           <div><label for="start-year">Start year</label><input id="start-year" type="number" value="2010" /></div>
           <div><label for="end-year">End year</label><input id="end-year" type="number" value="2025" /></div>
         </div>
-        <label for="series">Series games per opponent (Bo1 count)</label>
+        <label for="series">Series games per opponent</label>
         <input id="series" type="number" min="1" value="10" />
+        <div class="bracket-placeholder">
+          <div class="bracket-col"><h3>Regular season</h3><div class="bracket-slot">Your bot vs each roster opponent</div><div class="bracket-slot">Era decks assigned per year</div></div>
+          <div class="bracket-col"><h3>Learning</h3><div class="bracket-slot">All bots update between rounds</div></div>
+          <div class="bracket-col"><h3>Output</h3><div class="bracket-slot">Standings + per-bot policies</div></div>
+        </div>
+        <button class="primary" id="start-bracket" style="margin-top:12px; max-width:280px;">Start full season</button>
       </div>
 
-      <div id="loop-settings" class="hidden">
-        <div class="cols-2">
-          <div><label for="loop-year">Year to loop</label><input id="loop-year" type="number" value="2010" /></div>
+      <div id="stage-loop" class="hidden">
+        <p class="stage-title">Single-year drill</p>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div><label for="loop-year">Year</label><input id="loop-year" type="number" value="2010" /></div>
           <div><label for="cycles">Learning cycles</label><input id="cycles" type="number" min="1" value="5" /></div>
         </div>
         <label for="loop-series">Series per opponent</label>
         <input id="loop-series" type="number" min="1" value="10" />
+        <button class="primary" id="start-loop" style="margin-top:12px; max-width:280px;">Start year drill</button>
       </div>
 
-      <button class="primary" id="start">Start training job</button>
+      <div id="stage-health" class="hidden">
+        <p class="stage-title">Gateway health check</p>
+        <p class="hint">Smoke test that EDOPro can finish duels at the selected banlist. Almost no learning — use to verify setup.</p>
+        <button class="primary" id="start-health" style="margin-top:12px; max-width:280px;">Run health check</button>
+      </div>
+
       <p id="message"></p>
-    </section>
 
-    <section>
-      <h2>Jobs</h2>
-      <div id="jobs"><p class="sub">No jobs yet.</p></div>
-    </section>
-
-    <section style="grid-column:1/-1;">
-      <h2>Live log <span class="pill" id="selected-job">none</span></h2>
-      <pre id="log">Select a job to tail its log.</pre>
+      <div class="stage-split">
+        <div>
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;">
+            <p class="stage-title" style="margin:0;">Jobs</p>
+            <button type="button" class="danger" id="kill-all-jobs" title="Stop all running training jobs">Kill all</button>
+          </div>
+          <div class="stage-body" style="min-height:140px; max-height:220px;">
+            <div id="jobs"><p class="sub">No jobs yet.</p></div>
+          </div>
+        </div>
+        <div>
+          <p class="stage-title">Live duel feed <span class="pill" id="selected-job">none</span></p>
+          <div class="stage-body" style="min-height:200px; padding:0;">
+            <pre id="duel-log">Select a job to watch duels in real time.</pre>
+          </div>
+          <p class="stage-title" style="margin-top:10px; font-size:12px;">Process log</p>
+          <div class="stage-body" style="min-height:100px; padding:0;">
+            <pre id="log" style="font-size:11px; opacity:0.85;">CLI output appears here.</pre>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
+
   <script>
     let banlists = [], bots = [], opponents = [], selectedJob = null;
     const botSel = document.querySelector('#bot');
@@ -1576,6 +1965,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     const banlistSel = document.querySelector('#banlist');
     const deckSel = document.querySelector('#deck');
     const opponentDeckSel = document.querySelector('#opponent-deck');
+    const modeSel = document.querySelector('#mode-select');
     const msgEl = document.querySelector('#message');
 
     async function json(url, options) {
@@ -1585,35 +1975,39 @@ DASHBOARD_HTML = r"""<!doctype html>
       return text ? JSON.parse(text) : {};
     }
 
-    function mode() { return document.querySelector('input[name="mode"]:checked')?.value || 'bot-spar'; }
+    function mode() { return modeSel.value || 'bot-spar'; }
 
     function currentBanlist() { return banlists.find(p => p.path === banlistSel.value); }
+
+    const MODE_HINTS = {
+      'bot-spar': 'Focused duel — your bot plays N games vs one opponent. Only your bot\'s policy is updated.',
+      'format-pack': 'Meta sweep — run every meta deck vs every other at this banlist. Updates the shared global policy.',
+      'yearly-bracket': 'Full season — simulate 2010–2025 bracket. Your bot faces every roster opponent with era decks. All bots learn.',
+      'yearly-bracket-loop': 'Single-year drill — replay one calendar year multiple times with learning between cycles.',
+      'format-matrix': 'Gateway health check — quick smoke test that EDOPro can finish duels at this banlist.',
+    };
 
     function syncModePanels() {
       const m = mode();
       const isSpar = m === 'bot-spar';
       const isSeason = m === 'yearly-bracket' || m === 'yearly-bracket-loop';
-      document.querySelector('#spar-settings').classList.toggle('hidden', isSeason);
-      document.querySelector('#bracket-settings').classList.toggle('hidden', m !== 'yearly-bracket');
-      document.querySelector('#loop-settings').classList.toggle('hidden', m !== 'yearly-bracket-loop');
+      document.querySelector('#mode-hint').textContent = MODE_HINTS[m] || '';
+      document.querySelector('#bot-row').classList.toggle('hidden', m === 'format-pack' || m === 'format-matrix');
+      document.querySelector('#bot-panel-opponent').classList.toggle('hidden', !isSpar);
+      document.querySelector('#train-deck-block').classList.toggle('hidden', !isSpar);
+      document.querySelector('#train-import-block').classList.toggle('hidden', !isSpar);
+      document.querySelector('#opponent-deck-block').classList.toggle('hidden', !isSpar);
+      document.querySelector('#opponent-import-block').classList.toggle('hidden', !isSpar);
+      document.querySelector('#stage-spar').classList.toggle('hidden', !isSpar);
+      document.querySelector('#stage-meta').classList.toggle('hidden', m !== 'format-pack');
+      document.querySelector('#stage-bracket').classList.toggle('hidden', m !== 'yearly-bracket');
+      document.querySelector('#stage-loop').classList.toggle('hidden', m !== 'yearly-bracket-loop');
+      document.querySelector('#stage-health').classList.toggle('hidden', m !== 'format-matrix');
       document.querySelector('#banlist-block').classList.toggle('hidden', isSeason);
-      document.querySelector('#meta-gallery-wrap').classList.toggle('hidden', isSeason);
-      document.querySelector('#opponent-bot-wrap').classList.toggle('hidden', !isSpar);
-      document.querySelector('#deck-pickers').classList.toggle('hidden', !isSpar);
-      document.querySelector('#ydk-import').classList.toggle('hidden', !isSpar);
       opponentBotSel.disabled = !isSpar;
       deckSel.disabled = !isSpar;
       opponentDeckSel.disabled = !isSpar;
-      const hint = document.querySelector('#banlist-hint');
-      if (isSeason) {
-        hint.textContent = 'Season modes assign decks automatically from the yearly bracket config.';
-      } else if (m === 'format-pack') {
-        hint.textContent = 'Runs all meta deck pairings legal at this banlist. No per-bot deck pick needed.';
-      } else if (m === 'format-matrix') {
-        hint.textContent = 'Verifies the EDOPro gateway can run duels at this banlist.';
-      } else {
-        hint.textContent = 'Format rules come from the banlist — pick your deck and your opponent.';
-      }
+      if (m === 'format-pack') loadBanlistGallery();
     }
 
     function deckOptionLabel(d) {
@@ -1623,13 +2017,28 @@ DASHBOARD_HTML = r"""<!doctype html>
       return `${d.label} (${d.main_count} main${extra}${side})`;
     }
 
-    function selectAssigned(selectEl, decks, assignedName) {
-      if (!assignedName) return;
+    function selectAssigned(selectEl, assignedName) {
+      if (!assignedName) return false;
       for (const opt of selectEl.options) {
         if (opt.value === `pack:${assignedName}` || opt.value === assignedName) {
           opt.selected = true;
-          return;
+          return true;
         }
+      }
+      return false;
+    }
+
+    function restoreDeckSelection(selectEl, preferredValue, assignedName, fallbackIndex) {
+      if (preferredValue) {
+        for (const opt of selectEl.options) {
+          if (opt.value === preferredValue) {
+            opt.selected = true;
+            return;
+          }
+        }
+      }
+      if (!selectAssigned(selectEl, assignedName) && fallbackIndex != null && selectEl.options.length > fallbackIndex) {
+        selectEl.selectedIndex = fallbackIndex;
       }
     }
 
@@ -1643,28 +2052,33 @@ DASHBOARD_HTML = r"""<!doctype html>
       ).join('');
     }
 
-    async function showDeckPreview(deckRef) {
+    async function showDeckPreview(deckRef, side) {
+      const prefix = side === 'opponent' ? 'opponent' : 'train';
+      const emptyEl = document.querySelector(`#${prefix}-preview-empty`);
+      const contentEl = document.querySelector(`#${prefix}-preview-content`);
       if (!deckRef || deckRef === 'all') {
-        document.querySelector('#deck-preview').classList.add('hidden');
+        emptyEl.classList.remove('hidden');
+        contentEl.classList.add('hidden');
         return;
       }
       try {
         const data = await json(
           `/api/decks/visual?pack=${encodeURIComponent(banlistSel.value)}&deck=${encodeURIComponent(deckRef)}`
         );
-        document.querySelector('#preview-title').textContent = data.archetype || data.name;
-        renderCardGrid(document.querySelector('#preview-main'), data.main);
-        const extraEl = document.querySelector('#preview-extra');
-        const sideEl = document.querySelector('#preview-side');
+        document.querySelector(`#preview-title-${prefix}`).textContent = data.archetype || data.name;
+        renderCardGrid(document.querySelector(`#preview-main-${prefix}`), data.main);
+        const extraEl = document.querySelector(`#preview-extra-${prefix}`);
+        const sideEl = document.querySelector(`#preview-side-${prefix}`);
         const hasExtra = !!(data.extra && data.extra.length);
         const hasSide = !!(data.side && data.side.length);
-        document.querySelector('#preview-extra-label').classList.toggle('hidden', !hasExtra);
+        document.querySelector(`#preview-extra-label-${prefix}`).classList.toggle('hidden', !hasExtra);
         extraEl.classList.toggle('hidden', !hasExtra);
-        document.querySelector('#preview-side-label').classList.toggle('hidden', !hasSide);
+        document.querySelector(`#preview-side-label-${prefix}`).classList.toggle('hidden', !hasSide);
         sideEl.classList.toggle('hidden', !hasSide);
         renderCardGrid(extraEl, data.extra);
         renderCardGrid(sideEl, data.side);
-        document.querySelector('#deck-preview').classList.remove('hidden');
+        emptyEl.classList.add('hidden');
+        contentEl.classList.remove('hidden');
       } catch (err) {
         msgEl.textContent = String(err);
       }
@@ -1673,7 +2087,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     async function loadBanlistGallery() {
       const packPath = banlistSel.value;
       const grid = document.querySelector('#meta-deck-grid');
-      if (!packPath || mode() === 'yearly-bracket' || mode() === 'yearly-bracket-loop') {
+      if (!packPath || mode() !== 'format-pack') {
         grid.innerHTML = '';
         return;
       }
@@ -1682,8 +2096,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const data = await json(`/api/banlist-decks?pack=${encodeURIComponent(packPath)}`);
         grid.innerHTML = (data.decks || []).map(deck => {
           const cover = deck.main?.[0]?.image_url || '';
-          const deckId = `pack:${deck.name}`;
-          return `<div class="meta-deck-card" data-deck="${deckId}">
+          return `<div class="meta-deck-card" data-deck="pack:${deck.name}">
             <img src="${cover}" alt="${deck.archetype || deck.name}" loading="lazy" onerror="this.style.opacity='0.35'" />
             <strong>${deck.archetype || deck.name}</strong>
             <span>${deck.main_count} main · ${deck.extra_count} extra · ${deck.side_count || 0} side</span>
@@ -1693,33 +2106,30 @@ DASHBOARD_HTML = r"""<!doctype html>
           node.addEventListener('click', () => {
             grid.querySelectorAll('.meta-deck-card').forEach(item => item.classList.remove('selected'));
             node.classList.add('selected');
-            if (mode() === 'bot-spar') {
-              for (const opt of deckSel.options) {
-                if (opt.value === node.dataset.deck) { opt.selected = true; showDeckPreview(node.dataset.deck); return; }
-              }
-              for (const opt of opponentDeckSel.options) {
-                if (opt.value === node.dataset.deck) { opt.selected = true; showDeckPreview(node.dataset.deck); return; }
-              }
-            }
-            showDeckPreview(node.dataset.deck);
+            const deckRef = node.dataset.deck;
+            if (deckRef) deckSel.value = deckRef;
+            showDeckPreview(deckRef, 'train');
           });
         });
         if (data.decks?.length) {
           grid.querySelector('.meta-deck-card')?.classList.add('selected');
-          showDeckPreview(`pack:${data.decks[0].name}`);
         }
       } catch (err) {
         grid.innerHTML = `<p class="hint">${String(err)}</p>`;
       }
     }
 
-    async function populateMatchSetup() {
+    async function populateMatchSetup(options = {}) {
+      const preserveTrain = options.preserveTrain !== false;
+      const preserveOpponent = options.preserveOpponent !== false;
       const packPath = banlistSel.value;
       if (!packPath || mode() !== 'bot-spar') {
         deckSel.innerHTML = '';
         opponentDeckSel.innerHTML = '';
         return;
       }
+      const prevTrainDeck = preserveTrain ? deckSel.value : '';
+      const prevOpponentDeck = preserveOpponent ? opponentDeckSel.value : '';
       try {
         const data = await json(
           `/api/match-setup?train_bot_id=${encodeURIComponent(botSel.value)}`
@@ -1732,12 +2142,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         opponentDeckSel.innerHTML = (data.opponent_decks || []).map(d =>
           `<option value="${d.id}">${deckOptionLabel(d)}</option>`
         ).join('');
-        selectAssigned(deckSel, data.train_decks, data.train_assigned);
-        selectAssigned(opponentDeckSel, data.opponent_decks, data.opponent_assigned);
-        if (!data.opponent_assigned && opponentDeckSel.options.length > 1) {
-          opponentDeckSel.selectedIndex = 1;
-        }
-        if (deckSel.value) showDeckPreview(deckSel.value);
+        restoreDeckSelection(deckSel, prevTrainDeck, data.train_assigned, null);
+        restoreDeckSelection(
+          opponentDeckSel,
+          prevOpponentDeck,
+          data.opponent_assigned,
+          data.opponent_assigned ? null : 1,
+        );
+        if (deckSel.value) showDeckPreview(deckSel.value, 'train');
+        if (opponentDeckSel.value) showDeckPreview(opponentDeckSel.value, 'opponent');
       } catch (err) {
         msgEl.textContent = String(err);
         deckSel.innerHTML = '';
@@ -1760,21 +2173,26 @@ DASHBOARD_HTML = r"""<!doctype html>
       const pack = currentBanlist();
       if (pack) {
         document.querySelector('#games').value = Math.min(pack.default_games, 25);
-        document.querySelector('#decisions').value = Math.max(pack.default_max_decisions, 600);
-        document.querySelector('#banlist-hint').textContent = pack.banlist_source || pack.description || '';
+        document.querySelector('#decisions').value = pack.default_max_decisions ?? 0;
       }
-      populateMatchSetup();
+      populateMatchSetup({ preserveTrain: false, preserveOpponent: false });
       loadBanlistGallery();
     });
-    botSel.addEventListener('change', () => { updateBotMeta(); populateMatchSetup(); });
-    opponentBotSel.addEventListener('change', () => { updateBotMeta(); populateMatchSetup(); });
-    deckSel.addEventListener('change', () => showDeckPreview(deckSel.value));
-    opponentDeckSel.addEventListener('change', () => showDeckPreview(opponentDeckSel.value));
-    document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener('change', () => {
+    botSel.addEventListener('change', () => {
+      updateBotMeta();
+      populateMatchSetup({ preserveTrain: false, preserveOpponent: true });
+    });
+    opponentBotSel.addEventListener('change', () => {
+      updateBotMeta();
+      populateMatchSetup({ preserveTrain: true, preserveOpponent: false });
+    });
+    deckSel.addEventListener('change', () => showDeckPreview(deckSel.value, 'train'));
+    opponentDeckSel.addEventListener('change', () => showDeckPreview(opponentDeckSel.value, 'opponent'));
+    modeSel.addEventListener('change', () => {
       syncModePanels();
-      populateMatchSetup();
+      populateMatchSetup({ preserveTrain: false, preserveOpponent: false });
       loadBanlistGallery();
-    }));
+    });
 
     async function loadData() {
       const data = await json('/api/training-bootstrap');
@@ -1792,28 +2210,30 @@ DASHBOARD_HTML = r"""<!doctype html>
         `<option value="${o.bot_id}">${o.label || o.name}</option>`
       ).join('');
       if (opponentBotSel.options.length > 1) opponentBotSel.selectedIndex = 1;
-      const first = currentBanlist();
-      if (first?.banlist_source) document.querySelector('#banlist-hint').textContent = first.banlist_source;
       updateBotMeta();
       syncModePanels();
       await populateMatchSetup();
       await loadBanlistGallery();
     }
 
-    async function importYdk() {
-      const fileInput = document.querySelector('#ydk-file');
+    async function importYdk(which) {
+      const isOpponent = which === 'opponent';
+      const fileInput = document.querySelector(isOpponent ? '#opponent-ydk-file' : '#ydk-file');
+      const nameInput = document.querySelector(isOpponent ? '#opponent-ydk-name' : '#ydk-name');
+      const btn = document.querySelector(isOpponent ? '#import-opponent-ydk' : '#import-ydk');
+      const targetBot = isOpponent ? opponentBotSel : botSel;
+      const targetDeckSel = isOpponent ? opponentDeckSel : deckSel;
       const file = fileInput.files?.[0];
       if (!file) {
         msgEl.textContent = 'Choose a .ydk file first.';
         return;
       }
-      const btn = document.querySelector('#import-ydk');
       btn.disabled = true;
       msgEl.textContent = 'Importing deck…';
       try {
         const form = new FormData();
-        form.append('bot_id', botSel.value);
-        form.append('deck_name', document.querySelector('#ydk-name').value || file.name.replace(/\.ydk$/i, ''));
+        form.append('bot_id', targetBot.value);
+        form.append('deck_name', nameInput.value || file.name.replace(/\.ydk$/i, ''));
         form.append('ydk', file, file.name);
         const res = await fetch('/api/decks/import-ydk', { method: 'POST', body: form });
         const text = await res.text();
@@ -1821,11 +2241,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         const data = JSON.parse(text);
         msgEl.textContent = `Imported: ${data.deck.name}`;
         fileInput.value = '';
-        document.querySelector('#ydk-name').value = '';
-        await populateMatchSetup();
-        for (const opt of deckSel.options) {
+        nameInput.value = '';
+        await populateMatchSetup({
+          preserveTrain: isOpponent,
+          preserveOpponent: !isOpponent,
+        });
+        for (const opt of targetDeckSel.options) {
           if (opt.value === `custom:${data.deck.deck_id}`) { opt.selected = true; break; }
         }
+        showDeckPreview(targetDeckSel.value, isOpponent ? 'opponent' : 'train');
       } catch (err) {
         msgEl.textContent = String(err);
       } finally {
@@ -1833,12 +2257,24 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
     }
 
+    function parseMaxDecisionsInput() {
+      const raw = document.querySelector('#decisions').value;
+      if (raw === '') {
+        return 0;
+      }
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        throw new Error('Max decisions must be 0 (unlimited) or a non-negative number.');
+      }
+      return Math.trunc(parsed);
+    }
+
     function buildPayload() {
       const m = mode();
       const payload = {
         job_kind: m,
         bot_id: botSel.value,
-        max_decisions: Number(document.querySelector('#decisions').value),
+        max_decisions: parseMaxDecisionsInput(),
       };
       if (m === 'yearly-bracket') {
         payload.start_year = Number(document.querySelector('#start-year').value);
@@ -1869,6 +2305,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       btn.disabled = true;
       msgEl.textContent = 'Starting job…';
       try {
+        parseMaxDecisionsInput();
         const data = await json('/api/jobs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1892,13 +2329,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       if (!data.jobs.length) { el.innerHTML = '<p class="sub">No jobs yet.</p>'; return; }
       el.innerHTML = data.jobs.map(j => {
         const links = j.status === 'completed'
-          ? `<a href="/api/jobs/${j.job_id}/summary" target="_blank">Learning report</a> · <a href="/api/jobs/${j.job_id}/report" target="_blank">Raw report</a>`
+          ? `<a href="/api/jobs/${j.job_id}/summary" target="_blank">Report</a>`
           : (j.error ? `<span style="color:var(--bad)">${j.error}</span>` : '');
         return `<div class="job" data-job="${j.job_id}">
           <span class="status ${j.status}">${j.status}</span>
           <span class="pill">${j.job_kind || 'format-pack'}</span>
           <strong>${j.label || j.pack || j.job_id}</strong>
-          <p class="sub">${j.bot_name || ''}${j.opponent_bot_name ? ' vs ' + j.opponent_bot_name : ''} ${j.deck_name ? '· ' + j.deck_name : ''}${j.opponent_deck_name ? ' vs ' + j.opponent_deck_name : ''} · ${j.games_per_matchup} games · ${j.max_decisions} decisions</p>
+          <p class="sub" style="margin:4px 0 0;font-size:11px;">${j.bot_name || ''}${j.opponent_bot_name ? ' vs ' + j.opponent_bot_name : ''} · ${j.games_per_matchup} games</p>
           ${links}
         </div>`;
       }).join('');
@@ -1911,17 +2348,92 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     async function loadLog() {
       if (!selectedJob) return;
-      const res = await fetch(`/api/jobs/${selectedJob}/log`);
-      const text = await res.text();
-      const pre = document.querySelector('#log');
-      pre.textContent = text || '(empty log)';
-      pre.scrollTop = pre.scrollHeight;
+      const [duelRes, jobRes] = await Promise.all([
+        fetch(`/api/jobs/${selectedJob}/duel-log`),
+        fetch(`/api/jobs/${selectedJob}/log`),
+      ]);
+      const duelPre = document.querySelector('#duel-log');
+      const jobPre = document.querySelector('#log');
+      const duelText = await duelRes.text();
+      const jobText = await jobRes.text();
+      duelPre.textContent = duelText || '(waiting for first duel — job may still be starting)';
+      duelPre.scrollTop = duelPre.scrollHeight;
+      const tail = jobText.length > 5000 ? jobText.slice(-5000) : jobText;
+      jobPre.textContent = tail || '(empty process log)';
+      jobPre.scrollTop = jobPre.scrollHeight;
     }
 
+    async function killAllJobs() {
+      if (!confirm('Stop all running training jobs? Duels in progress will be interrupted.')) {
+        return;
+      }
+      const btn = document.querySelector('#kill-all-jobs');
+      btn.disabled = true;
+      try {
+        const data = await json('/api/jobs/kill-all', { method: 'POST' });
+        msgEl.textContent = data.count
+          ? `Stopped ${data.count} job(s).`
+          : 'No running jobs to stop.';
+        await loadJobs();
+        await loadLog();
+      } catch (err) {
+        msgEl.textContent = String(err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.querySelector('#kill-all-jobs').addEventListener('click', killAllJobs);
     document.querySelector('#start').addEventListener('click', startJob);
-    document.querySelector('#import-ydk').addEventListener('click', importYdk);
-    setInterval(() => { loadJobs(); loadLog(); }, 3000);
-    loadData().then(loadJobs).catch(err => { msgEl.textContent = String(err); });
+    document.querySelector('#start-meta').addEventListener('click', startJob);
+    document.querySelector('#start-bracket').addEventListener('click', startJob);
+    document.querySelector('#start-loop').addEventListener('click', startJob);
+    document.querySelector('#start-health').addEventListener('click', startJob);
+    document.querySelector('#import-ydk').addEventListener('click', () => importYdk('train'));
+    document.querySelector('#import-opponent-ydk').addEventListener('click', () => importYdk('opponent'));
+    function renderBotStats(data) {
+      const updated = document.querySelector('#bot-stats-updated');
+      const body = document.querySelector('#bot-stats-body');
+      if (!updated || !body) return;
+      const stamp = data.updated_at ? `Updated ${data.updated_at}` : 'Not updated yet';
+      const totals = data.totals || {};
+      updated.textContent = `${stamp} · ${totals.training_duels || 0} training duels · ${totals.total_decisions || 0} decisions logged`;
+      const bots = data.bots || [];
+      if (!bots.length) {
+        body.innerHTML = '<tr><td colspan="8">No bot stats yet — run a training job or upload a replay.</td></tr>';
+        return;
+      }
+      body.innerHTML = bots.map(bot => `
+        <tr>
+          <td><strong>${bot.name}</strong><br/><span class="hint">${bot.bot_id}</span></td>
+          <td>${bot.training_duels ?? 0}</td>
+          <td>${bot.human_duels ?? 0}</td>
+          <td>${bot.training_sessions ?? 0}</td>
+          <td>${bot.policy_updates ?? 0}</td>
+          <td>${bot.avg_duel_turns != null ? bot.avg_duel_turns : '—'}</td>
+          <td>${bot.avg_decisions_per_game != null ? bot.avg_decisions_per_game : '—'}</td>
+          <td>${bot.last_trained_at ? bot.last_trained_at.replace('T', ' ').replace('Z', ' UTC') : '—'}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadBotStats(refresh) {
+      const url = refresh ? '/api/bot-stats?refresh=1' : '/api/bot-stats';
+      try {
+        const data = await json(url);
+        renderBotStats(data);
+      } catch (err) {
+        const updated = document.querySelector('#bot-stats-updated');
+        if (updated) updated.textContent = String(err);
+      }
+    }
+
+    setInterval(() => {
+      loadJobs();
+      loadLog();
+      loadBotStats(true);
+    }, 1000);
+    loadData().then(() => Promise.all([loadJobs(), loadBotStats(false)])).catch(err => { msgEl.textContent = String(err); });
   </script>
 </body>
 </html>
@@ -1957,26 +2469,31 @@ REPLAYS_HTML = r"""<!doctype html>
     .bad { color: var(--bad); }
     .hint { font-size: 13px; margin-top: 8px; }
     a { color: var(--accent); }
+    .stats-table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+    .stats-table th, .stats-table td { text-align:left; padding:6px 8px; border-bottom:1px solid rgba(148,163,184,.14); }
+    .stats-table th { color:var(--muted); font-size:11px; text-transform:uppercase; }
     @media (min-width: 850px) { .grid { grid-template-columns: 380px 1fr; } }
   </style>
 </head>
 <body>
   <header>
     <h1>Human Replay Upload</h1>
-    <p>Upload JSON duel logs so the bot can analyze your lines and update its learned policy. <a href="/">← Training dashboard</a></p>
+    <p>Upload EDOPro <code>.yrpX</code> replays or JSON duel logs — conversion, import, and learning happen here. <a href="/">← Training dashboard</a></p>
   </header>
   <main class="grid">
     <section>
       <h2>Upload replays</h2>
-      <p class="hint">Use full game logs or decisions-only JSON. EDOPro <code>.yrp</code> files must be converted first — see <code>data/human-duels/examples/</code>.</p>
-      <label for="files">Replay files (.json)</label>
-      <input id="files" type="file" accept=".json,application/json" multiple />
-      <button id="upload">Upload &amp; import</button>
-      <label for="study-agent">Study player (optional)</label>
-      <select id="study-agent"><option value="">All players / auto</option></select>
-      <label for="format">Format filter (optional)</label>
-      <select id="format"><option value="">All formats</option></select>
-      <button id="learn" class="secondary">Analyze &amp; learn from catalog</button>
+      <p class="hint">Pick any <code>.yrpX</code> from your EDOPro <code>replay/</code> folder (timestamped saves work too), or JSON duel logs. You can select multiple files.</p>
+      <label for="files">Replay files</label>
+      <input id="files" type="file" accept=".yrpX,.yrp,.json,application/json" multiple />
+      <label for="study-agent">Your player name (for learning)</label>
+      <input id="study-agent" type="text" placeholder="e.g. name shown in EDOPro duel" list="study-agent-list" />
+      <datalist id="study-agent-list"></datalist>
+      <label for="format">Format tag (optional)</label>
+      <input id="format" type="text" placeholder="e.g. banlist-2026-01" list="format-list" />
+      <datalist id="format-list"></datalist>
+      <button id="upload">Upload, convert &amp; import</button>
+      <button id="learn" class="secondary">Analyze &amp; update policy</button>
       <p id="message"></p>
     </section>
     <section>
@@ -1985,8 +2502,20 @@ REPLAYS_HTML = r"""<!doctype html>
       <div id="duels"></div>
     </section>
     <section style="grid-column: 1 / -1;">
+      <h2>Bot training stats</h2>
+      <p class="hint" id="bot-stats-updated">Loading…</p>
+      <table class="stats-table">
+        <thead>
+          <tr>
+            <th>Bot</th><th>Duels</th><th>Human</th><th>Sessions</th><th>Updates</th><th>Avg turns</th><th>Avg actions</th>
+          </tr>
+        </thead>
+        <tbody id="bot-stats-body"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </section>
+    <section style="grid-column: 1 / -1;">
       <h2>What the bot learned</h2>
-      <pre id="summary">Upload replays and click Analyze &amp; learn.</pre>
+      <pre id="summary">Upload replays and click Analyze &amp; update policy.</pre>
     </section>
   </main>
   <script>
@@ -1994,8 +2523,8 @@ REPLAYS_HTML = r"""<!doctype html>
     const statsEl = document.querySelector('#stats');
     const duelsEl = document.querySelector('#duels');
     const summaryEl = document.querySelector('#summary');
-    const studySelect = document.querySelector('#study-agent');
-    const formatSelect = document.querySelector('#format');
+    const studyInput = document.querySelector('#study-agent');
+    const formatInput = document.querySelector('#format');
 
     async function json(url, options) {
       const res = await fetch(url, options);
@@ -2012,10 +2541,45 @@ REPLAYS_HTML = r"""<!doctype html>
     function fillFilters(catalog) {
       const agents = catalog.study_agents || [];
       const formats = catalog.formats || [];
-      studySelect.innerHTML = '<option value="">All players / auto</option>' +
-        agents.map(a => `<option value="${a}">${a}</option>`).join('');
-      formatSelect.innerHTML = '<option value="">All formats</option>' +
-        formats.map(f => `<option value="${f}">${f}</option>`).join('');
+      const agentList = document.querySelector('#study-agent-list');
+      const formatList = document.querySelector('#format-list');
+      if (agentList) {
+        agentList.innerHTML = agents.map(a => `<option value="${a}"></option>`).join('');
+      }
+      if (formatList) {
+        formatList.innerHTML = formats.map(f => `<option value="${f}"></option>`).join('');
+      }
+    }
+
+    function renderBotStats(data) {
+      const updated = document.querySelector('#bot-stats-updated');
+      const body = document.querySelector('#bot-stats-body');
+      if (!updated || !body) return;
+      updated.textContent = data.updated_at
+        ? `Updated ${data.updated_at} (refreshes after each training session)`
+        : 'No stats yet';
+      const bots = data.bots || [];
+      body.innerHTML = bots.length ? bots.map(bot => `
+        <tr>
+          <td>${bot.name} <span class="hint">(${bot.bot_id})</span></td>
+          <td>${bot.training_duels ?? 0}</td>
+          <td>${bot.human_duels ?? 0}</td>
+          <td>${bot.training_sessions ?? 0}</td>
+          <td>${bot.policy_updates ?? 0}</td>
+          <td>${bot.avg_duel_turns ?? '—'}</td>
+          <td>${bot.avg_decisions_per_game ?? '—'}</td>
+        </tr>
+      `).join('') : '<tr><td colspan="7">No training data yet.</td></tr>';
+    }
+
+    async function loadBotStats(refresh) {
+      const url = refresh ? '/api/bot-stats?refresh=1' : '/api/bot-stats';
+      try {
+        renderBotStats(await json(url));
+      } catch (err) {
+        const el = document.querySelector('#bot-stats-updated');
+        if (el) el.textContent = String(err);
+      }
     }
 
     async function loadCatalog() {
@@ -2046,17 +2610,25 @@ REPLAYS_HTML = r"""<!doctype html>
         return;
       }
       button.disabled = true;
-      setMessage('Uploading…', true);
+      setMessage('Uploading and converting…', true);
       try {
         const form = new FormData();
         for (const file of input.files) form.append('files', file, file.name);
+        if (studyInput.value.trim()) form.append('study_agent', studyInput.value.trim());
+        if (formatInput.value.trim()) form.append('format', formatInput.value.trim());
         const res = await fetch('/api/human-duels/upload', { method: 'POST', body: form });
         const data = JSON.parse(await res.text());
         if (!res.ok) throw new Error((data.errors && data.errors[0] && data.errors[0].error) || 'Upload failed');
         const errCount = (data.errors || []).length;
-        setMessage(`Imported ${data.imported} replay(s)` + (errCount ? ` · ${errCount} error(s)` : ''), errCount === 0);
+        const converted = data.converted_from_replay || 0;
+        let msg = `Imported ${data.imported} replay(s)`;
+        if (converted) msg += ` (${converted} converted from EDOPro)`;
+        if (errCount) msg += ` · ${errCount} error(s)`;
+        setMessage(msg, errCount === 0 && data.imported > 0);
         input.value = '';
         await loadCatalog();
+        if (data.bot_stats) renderBotStats(data.bot_stats);
+        else await loadBotStats(true);
       } catch (err) {
         setMessage(String(err), false);
       } finally {
@@ -2070,8 +2642,8 @@ REPLAYS_HTML = r"""<!doctype html>
       setMessage('Analyzing replays and updating policy…', true);
       try {
         const payload = {
-          study_agent: studySelect.value || null,
-          format: formatSelect.value || null,
+          study_agent: studyInput.value.trim() || null,
+          format: formatInput.value.trim() || null,
         };
         const data = await json('/api/human-duels/learn', {
           method: 'POST',
@@ -2080,6 +2652,8 @@ REPLAYS_HTML = r"""<!doctype html>
         });
         summaryEl.textContent = data.summary || 'Learning complete.';
         setMessage(`Learned from ${data.total_games} game(s), ${data.total_decisions} decision(s). Policy updated.`, true);
+        if (data.bot_stats) renderBotStats(data.bot_stats);
+        else await loadBotStats(true);
       } catch (err) {
         setMessage(String(err), false);
       } finally {
@@ -2089,7 +2663,8 @@ REPLAYS_HTML = r"""<!doctype html>
 
     document.querySelector('#upload').addEventListener('click', uploadFiles);
     document.querySelector('#learn').addEventListener('click', learnFromCatalog);
-    loadCatalog().then(loadSummary).catch(err => setMessage(String(err), false));
+    loadCatalog().then(loadSummary).then(() => loadBotStats(false)).catch(err => setMessage(String(err), false));
+    setInterval(() => loadBotStats(true), 5000);
   </script>
 </body>
 </html>

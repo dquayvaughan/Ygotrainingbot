@@ -86,6 +86,25 @@ def test_load_format_pack_with_banlist_and_decks(tmp_path: Path) -> None:
     assert pack.banlist.limit_for(3) == 2
     assert pack.banlist.limit_for(4) == 3
     assert [deck.name for deck in pack.decks] == ["deck one", "deck two"]
+    assert pack.max_duel_turns == 0
+
+
+def test_load_format_pack_honors_max_duel_turns_override(tmp_path: Path) -> None:
+    pack_path = tmp_path / "pack.json"
+    pack_path.write_text(
+        json.dumps(
+            {
+                "name": "fast-pack",
+                "max_duel_turns": 12,
+                "decks": [{"name": "deck one", "main": [1184620] * 40}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pack = load_format_pack(pack_path)
+
+    assert pack.max_duel_turns == 12
 
 
 def test_repository_format_packs_load() -> None:

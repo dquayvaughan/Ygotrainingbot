@@ -2,7 +2,7 @@
 set -euo pipefail
 
 TARGET_DIR="${1:-/tmp/ygotrain/edopro-home}"
-WORK_DIR="${2:-/tmp/ygotrain/EDOpro-server-ts}"
+WORK_DIR="${YGOTRAIN_EDOPRO_BUILD_DIR:-${2:-/tmp/ygotrain/EDOpro-server-ts}}"
 
 REPOS_DIR="$WORK_DIR/repositories"
 SCRIPTS_DIR="$REPOS_DIR/edopro-card-scripts"

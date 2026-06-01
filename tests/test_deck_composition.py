@@ -29,7 +29,20 @@ def test_normalize_deck_dict_builds_side_and_extra() -> None:
     assert len(payload["side"]) <= 15
 
 
-def test_normalize_deck_dict_can_preserve_tournament_lists() -> None:
+def test_normalize_deck_dict_canonicalizes_edopro_card_aliases() -> None:
+    payload = normalize_deck_dict(
+        {
+            "name": "Gravekeeper",
+            "archetype": "Gravekeeper",
+            "main": [44330098] * 40,
+            "extra": [44508095, 44508095],
+            "side": [],
+        },
+        pad_zones=False,
+        require_side=False,
+    )
+    assert payload["extra"] == [44508094, 44508094]
+
     payload = normalize_deck_dict(
         {
             "name": "Tournament",

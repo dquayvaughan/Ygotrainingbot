@@ -1,11 +1,13 @@
 {
-  "description": "Curated YGOPRODeck pretty_url slugs for archetypes where tournament API search is weak (Edison/Goat and older meta).",
+  "description": "Curated YGOPRODeck pretty_url slugs for archetypes where tournament API search is weak.",
   "decks": {
     "Quickdraw Dandywarrior": "quickdraw-dandy-edison-deck-655819",
     "Frog Monarch": "edison-frog-monarch-676921",
-    "Plant Synchro": "plant-synchro-edison-655820",
+    "Plant Synchro": "plant-synchro-41032",
     "Machina Gadget": "james-bown-top-8-machina-gadget-deck-edison-regional-recollect-511985",
     "X-Saber": "edison-x-saber-677484",
-    "Gravekeeper": "edison-gravekeeper-s-2-484372"
+    "Gravekeeper": "edison-gravekeeper-s-2-484372",
+    "Ryzeal": "ryzeal-551613",
+    "Dracotail Branded": "fire-king-snake-eye-677060"
   }
 }

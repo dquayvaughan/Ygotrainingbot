@@ -14,6 +14,10 @@ from urllib.parse import urlencode
 
 from ygotrainingbot.banlist_catalog import BanlistPeriod, banlist_periods
 from ygotrainingbot.deck_composition import normalize_deck_dict
+from ygotrainingbot.deck_quality import (
+    cache_url_is_overused,
+    validate_tournament_deck,
+)
 
 YGOPRODECK_GET_DECKS_URL = "https://ygoprodeck.com/api/decks/getDecks.php"
 YGOPRODECK_DECK_PAGE = "https://ygoprodeck.com/deck/{pretty_url}"
@@ -154,7 +158,7 @@ def period_date_range(period: BanlistPeriod) -> tuple[str, str]:
 def _parse_zone_json(raw: str | None) -> list[int]:
     if not raw:
         return []
-    return [int(card_id) for card_id in json.loads(raw)]
+    return [int(card_id) for card_id in json.loads(raw) if str(card_id).strip()]
 
 
 def deck_from_api_payload(raw: dict[str, Any], *, archetype: str) -> YgoProDeckDeck:
@@ -243,11 +247,25 @@ def _score_api_deck(
     score = len(matched) * 18
     if keywords and len(matched) == len(keywords):
         score += 30
+    if archetype.lower() in name:
+        score += 40
     if len(keywords) >= 2 and len(matched) >= len(keywords) - 1:
         score += 12
 
     hits = sum(1 for card_id in signature_ids if card_id in all_cards)
-    score += hits * 8
+    score += hits * 14
+
+    if signature_ids:
+        if hits == 0 and not matched:
+            return 0
+        if hits >= 2:
+            score += 35
+        elif hits == 1:
+            score += 22
+        elif matched:
+            score += 6
+        else:
+            return 0
 
     if raw.get("tournamentName"):
         score += 12
@@ -294,7 +312,10 @@ def search_tournament_deck(
             if best is None or score > best[0]:
                 best = (score, raw)
         time.sleep(REQUEST_DELAY_SECONDS)
-    if best is None or best[0] < 20:
+    if best is None:
+        return None
+    min_score = 45 if signature_ids else 20
+    if best[0] < min_score:
         return None
     deck = deck_from_api_payload(best[1], archetype=archetype)
     deck = YgoProDeckDeck(
@@ -362,6 +383,85 @@ def deck_to_dict(deck: YgoProDeckDeck, *, archetype: str, modern: bool, pad_zone
     return payload
 
 
+def trusted_cache_entry(
+    archetype: str,
+    entry: dict[str, Any],
+    *,
+    cache: dict[str, dict[str, Any]],
+    repo_root: Path | None = None,
+) -> bool:
+    signature_ids = signature_card_ids(archetype, repo_root=repo_root)
+    issues = validate_tournament_deck(
+        entry,
+        archetype=archetype,
+        signature_ids=signature_ids,
+        search_keywords=search_keywords(archetype),
+    )
+    if issues:
+        return False
+    if cache_url_is_overused(
+        entry,
+        archetype=archetype,
+        cache=cache,
+        search_keywords=search_keywords(archetype),
+    ):
+        return False
+    return True
+
+
+def search_named_meta_decks(
+    archetype: str,
+    *,
+    repo_root: Path | None = None,
+    max_pages: int = 4,
+) -> YgoProDeckDeck | None:
+    """Search YGOPRODeck Meta Decks by deck title (works for most eras)."""
+
+    signature_ids = signature_card_ids(archetype, repo_root=repo_root)
+    queries = [archetype]
+    if archetype == "HERO Beat":
+        queries.append("Hero Beat")
+    elif archetype == "Hero Beat":
+        queries.append("HERO Beat")
+    elif archetype == "HERO":
+        queries.extend(["HERO Beat", "Hero Beat"])
+    best: tuple[int, dict[str, Any]] | None = None
+    for query in queries:
+        for page in range(max_pages):
+            rows = _fetch_deck_search(
+                format="Meta Decks",
+                name=query,
+                num=50,
+                offset=page * 50,
+            )
+            if not rows:
+                break
+            for raw in rows:
+                score = _score_api_deck(raw, archetype=archetype, signature_ids=signature_ids)
+                if score <= 0:
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, raw)
+            time.sleep(REQUEST_DELAY_SECONDS)
+    if best is None:
+        return None
+    min_score = 40 if signature_ids else 30
+    if best[0] < min_score:
+        return None
+    deck = deck_from_api_payload(best[1], archetype=archetype)
+    return YgoProDeckDeck(
+        name=deck.name,
+        archetype=archetype,
+        main=deck.main,
+        extra=deck.extra,
+        side=deck.side,
+        source=deck.source,
+        pretty_url=deck.pretty_url,
+        deck_num=deck.deck_num,
+        tournament=deck.tournament,
+    )
+
+
 def resolve_deck_for_archetype(
     archetype: str,
     *,
@@ -375,14 +475,15 @@ def resolve_deck_for_archetype(
     if cache and archetype in cache:
         cached = dict(cache[archetype])
         cached["archetype"] = archetype
-        return normalize_deck_dict(cached, modern=modern, require_side=False, pad_zones=pad_zones)
+        if trusted_cache_entry(archetype, cached, cache=cache, repo_root=repo_root):
+            return normalize_deck_dict(cached, modern=modern, require_side=False, pad_zones=pad_zones)
 
     source_map = sources or load_deck_sources()
     pretty_url = source_map.get(archetype)
     if pretty_url:
         scraped = scrape_deck_page(pretty_url)
         time.sleep(REQUEST_DELAY_SECONDS)
-        return deck_to_dict(
+        candidate = deck_to_dict(
             YgoProDeckDeck(
                 name=scraped.name,
                 archetype=archetype,
@@ -396,6 +497,16 @@ def resolve_deck_for_archetype(
             modern=modern,
             pad_zones=pad_zones,
         )
+        signature_ids = signature_card_ids(archetype, repo_root=repo_root)
+        issues = validate_tournament_deck(
+            candidate,
+            archetype=archetype,
+            signature_ids=signature_ids,
+            search_keywords=search_keywords(archetype),
+        )
+        if not issues:
+            return candidate
+        return None
 
     start_date = end_date = None
     if period is not None:
@@ -411,6 +522,8 @@ def resolve_deck_for_archetype(
             repo_root=repo_root,
         )
     if api_deck is None:
+        api_deck = search_named_meta_decks(archetype, repo_root=repo_root)
+    if api_deck is None:
         api_deck = search_tournament_deck(
             archetype,
             deck_format="Meta Decks",
@@ -419,7 +532,21 @@ def resolve_deck_for_archetype(
         )
     if api_deck is None or len(api_deck.main) < 40:
         return None
-    return deck_to_dict(api_deck, archetype=archetype, modern=modern, pad_zones=pad_zones)
+    candidate = deck_to_dict(api_deck, archetype=archetype, modern=modern, pad_zones=pad_zones)
+    signature_ids = signature_card_ids(archetype, repo_root=repo_root)
+    issues = validate_tournament_deck(
+        candidate,
+        archetype=archetype,
+        signature_ids=signature_ids,
+        search_keywords=search_keywords(archetype),
+    )
+    if issues:
+        return None
+    return candidate
+
+
+def periods_for_archetype(archetype: str) -> tuple[BanlistPeriod, ...]:
+    return tuple(period for period in banlist_periods() if archetype in period.top5)
 
 
 def build_deck_cache(
@@ -430,27 +557,58 @@ def build_deck_cache(
 ) -> dict[str, dict[str, Any]]:
     sources = load_deck_sources(sources_path)
     periods = banlist_periods()
-    unique_archetypes: dict[str, BanlistPeriod] = {}
+    unique_archetypes: set[str] = set()
     for period in periods:
-        for archetype in period.top5:
-            if archetype not in unique_archetypes:
-                unique_archetypes[archetype] = period
+        unique_archetypes.update(period.top5)
 
-    cache: dict[str, dict[str, Any]] = {}
-    for archetype, period in sorted(unique_archetypes.items()):
-        modern = period.year >= 2017
-        resolved = resolve_deck_for_archetype(
-            archetype,
-            period=period,
-            sources=sources,
-            cache=None,
-            modern=modern,
-            pad_zones=False,
-            repo_root=repo_root,
-        )
-        if resolved is not None:
-            cache[archetype] = resolved
+    existing = load_deck_cache(repo_root / output_path)
+    cache: dict[str, dict[str, Any]] = {
+        archetype: dict(entry)
+        for archetype, entry in existing.items()
+        if trusted_cache_entry(archetype, entry, cache=existing, repo_root=repo_root)
+    }
+    used_urls = {
+        str(entry.get("ygoprodeck_url", "")).strip()
+        for entry in cache.values()
+        if entry.get("ygoprodeck_url")
+    }
+
+    for archetype in sorted(unique_archetypes):
+        if archetype in cache:
+            continue
+        period_list = periods_for_archetype(archetype)
+        resolved = None
+        for period in sorted(period_list, key=lambda item: item.sort_key, reverse=True):
+            resolved = resolve_deck_for_archetype(
+                archetype,
+                period=period,
+                sources=sources,
+                cache=cache,
+                modern=period.year >= 2017,
+                pad_zones=False,
+                repo_root=repo_root,
+            )
+            if resolved is not None:
+                break
+        if resolved is None:
+            resolved = resolve_deck_for_archetype(
+                archetype,
+                period=None,
+                sources=sources,
+                cache=cache,
+                modern=True,
+                pad_zones=False,
+                repo_root=repo_root,
+            )
+        if resolved is None:
+            continue
+        url = str(resolved.get("ygoprodeck_url", "")).strip()
+        if url:
+            if url in used_urls:
+                continue
+            used_urls.add(url)
+        cache[archetype] = resolved
         time.sleep(REQUEST_DELAY_SECONDS)
 
-    save_deck_cache(cache, output_path)
+    save_deck_cache(cache, repo_root / output_path)
     return cache

@@ -5,6 +5,7 @@ import createCore, {
   OcgMessageType,
   OcgPosition,
   OcgProcessResult,
+  OcgQueryFlags,
   OcgResponseType,
   SelectBattleCMDAction,
   SelectIdleCMDAction,
@@ -20,7 +21,9 @@ import createCore, {
 } from "ocgcore-wasm";
 import Database from "better-sqlite3";
 import { createInterface } from "node:readline/promises";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import process from "node:process";
 
@@ -29,7 +32,8 @@ const DEFAULT_DECK_B = Array(40).fill(3134241); // Flying Kamakiri #1, level 4 n
 
 const args = parseArgs(process.argv.slice(2));
 const edoproHome = path.resolve(args.edoproHome ?? process.env.EDOPRO_HOME ?? ".");
-const maxDecisions = Number(args.maxDecisions ?? 80);
+let maxDecisions = Number(args.maxDecisions ?? 0);
+let maxDuelTurns = Number(args.maxDuelTurns ?? 0);
 const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 const stdinIterator = rl[Symbol.asyncIterator]();
 const scriptCache = new Map();
@@ -50,31 +54,90 @@ let lib;
 let handle;
 let currentDuelSeed = [1n, 2n, 3n, 4n];
 let duelMode = OcgDuelMode.MODE_MR3;
+let lastDuelOutboundAt = Date.now();
 
 const HARD_STEP_LIMIT = 500_000;
-const STALL_STEP_THRESHOLD = 8_000;
-const RETRY_STALL_THRESHOLD = 2_500;
+const STALL_STEP_THRESHOLD = 2_000;
+const LP_STALL_STEP_LIMIT = 2_500;
+const CONTINUE_STALL_STREAK = 4_000;
+const CONTINUE_ONLY_STREAK_LIMIT = 4_000;
+const ENGINE_SILENCE_MS = 90_000;
+const SOFT_MAX_DECISIONS_UNLIMITED = 800;
+const MAX_IGNORED_WIN_MESSAGES = 6;
+const RETRY_PENDING_SPIN_LIMIT = 64;
+const STALL_IDLE_AGENT_THRESHOLD = 600;
+const RETRY_STALL_THRESHOLD = 250;
+const MAX_SELECT_CARD_RETRIES_PER_PROMPT = 64;
+const MAX_PROMPT_RETRIES_PER_PROMPT = 48;
 const LOG_ENGINE_EVERY_STEPS = 10_000;
+
+const OCGCORE_SELECT_PATCH_MARKER = "t.i32(0),t.i32(e.indicies.length);for(let r of e.indicies)t.i32(r)";
+
+const PROMPT_MESSAGE_TYPES = new Set([
+  OcgMessageType.SELECT_BATTLECMD,
+  OcgMessageType.SELECT_IDLECMD,
+  OcgMessageType.SELECT_EFFECTYN,
+  OcgMessageType.SELECT_YESNO,
+  OcgMessageType.SELECT_OPTION,
+  OcgMessageType.SELECT_CARD,
+  OcgMessageType.SELECT_CHAIN,
+  OcgMessageType.SELECT_PLACE,
+  OcgMessageType.SELECT_POSITION,
+  OcgMessageType.SELECT_TRIBUTE,
+  OcgMessageType.SORT_CHAIN,
+  OcgMessageType.SELECT_COUNTER,
+  OcgMessageType.SELECT_SUM,
+  OcgMessageType.SELECT_DISFIELD,
+  OcgMessageType.SORT_CARD,
+  OcgMessageType.SELECT_UNSELECT_CARD,
+  OcgMessageType.ANNOUNCE_RACE,
+  OcgMessageType.ANNOUNCE_ATTRIB,
+  OcgMessageType.ANNOUNCE_CARD,
+  OcgMessageType.ANNOUNCE_NUMBER,
+]);
 
 async function runDuel() {
   let decisions = 0;
+  let duelTurn = 1;
   let winner = null;
   let loser = null;
   let endReason = null;
   let retryQueue = [];
   let retryOnlySteps = 0;
+  let lastPromptContext = null;
+  let lastObservableMessages = [];
   const lifePoints = [8000, 8000];
   let lastLpKey = `${lifePoints[0]}/${lifePoints[1]}`;
   let lastLpChangeStep = 0;
   let continueOnlyStreak = 0;
+  let ignoredWinStreak = 0;
+  lastDuelOutboundAt = Date.now();
   for (let step = 0; step < HARD_STEP_LIMIT; step += 1) {
     const status = await lib.duelProcess(handle);
     const messages = lib.duelGetMessage(handle);
+    const observableMessages = messages.filter((message) => message.type !== OcgMessageType.RETRY);
+    if (observableMessages.length > 0) {
+      lastObservableMessages = messages;
+    }
+    const promptMessages = resolvePromptMessages(messages, lastObservableMessages);
     const lpKey = `${lifePoints[0]}/${lifePoints[1]}`;
     if (lpKey !== lastLpKey) {
       lastLpKey = lpKey;
       lastLpChangeStep = step;
       retryOnlySteps = 0;
+    }
+    const stallSteps = step - lastLpChangeStep;
+    if (stallSteps >= LP_STALL_STEP_LIMIT) {
+      finishEngineStall({
+        lifePoints,
+        decisions,
+        duelTurn,
+        stallSteps,
+        continueOnlyStreak,
+        silenceMs: Date.now() - lastDuelOutboundAt,
+        reason: "lp_stall",
+      });
+      return;
     }
     if (step === 0 || step % LOG_ENGINE_EVERY_STEPS === 0) {
       emitLog({
@@ -88,7 +151,9 @@ async function runDuel() {
     }
     let winMessage = null;
     for (const message of messages) {
-      if (message.type === OcgMessageType.DAMAGE) {
+      if (message.type === OcgMessageType.NEW_TURN) {
+        duelTurn += 1;
+      } else if (message.type === OcgMessageType.DAMAGE) {
         lifePoints[message.player] -= message.amount;
       } else if (message.type === OcgMessageType.RECOVER) {
         lifePoints[message.player] += message.amount;
@@ -100,27 +165,52 @@ async function runDuel() {
     }
     if (winMessage) {
       if (isDeckoutWinReason(winMessage.reason)) {
+        ignoredWinStreak = 0;
         winner = playerName(winMessage.player);
         loser = playerName(winMessage.player === 0 ? 1 : 0);
         endReason = "deckout";
       } else if (isLpWinReason(winMessage.reason) || outcomeFromLifePoints(lifePoints)) {
+        ignoredWinStreak = 0;
         winner = playerName(winMessage.player);
         loser = playerName(winMessage.player === 0 ? 1 : 0);
         endReason = "lp";
       } else {
+        ignoredWinStreak += 1;
         emitLog({
           event: decisions === 0 ? "ignored_premature_win" : "ignored_win",
           reason: winMessage.reason,
           life_points: [...lifePoints],
           player: winMessage.player,
+          ignored_win_streak: ignoredWinStreak,
         });
+        if (ignoredWinStreak >= MAX_IGNORED_WIN_MESSAGES) {
+          const forced = outcomeFromTurnLimit(lifePoints);
+          emitLog({
+            event: "ignored_win_cap",
+            ignored_win_streak: ignoredWinStreak,
+            life_points: [...lifePoints],
+          });
+          emitResult({
+            winner: forced.winner,
+            loser: forced.loser,
+            turns: Math.max(1, duelTurn),
+            decisions,
+            end_reason: "engine_stall",
+            life_points: [...lifePoints],
+            tags: ["edopro", "ocgcore-wasm", "ignored_win"],
+            script_stats: scriptLoadStats,
+          });
+          return;
+        }
       }
+    } else {
+      ignoredWinStreak = 0;
     }
     if (winner !== null && loser !== null) {
       emitResult({
         winner,
         loser,
-        turns: countTurns(messages),
+        turns: Math.max(1, duelTurn),
         decisions,
         end_reason: endReason ?? "lp",
         life_points: [...lifePoints],
@@ -135,7 +225,7 @@ async function runDuel() {
       emitResult({
         winner: lifeOutcome.winner,
         loser: lifeOutcome.loser,
-        turns: countTurns(messages),
+        turns: Math.max(1, duelTurn),
         decisions,
         end_reason: "lp",
         life_points: [...lifePoints],
@@ -150,7 +240,7 @@ async function runDuel() {
       emitResult({
         winner: deckOutcome.winner,
         loser: deckOutcome.loser,
-        turns: countTurns(messages),
+        turns: Math.max(1, duelTurn),
         decisions,
         end_reason: "deckout",
         life_points: [...lifePoints],
@@ -167,11 +257,50 @@ async function runDuel() {
     }
     if (status === OcgProcessResult.CONTINUE) {
       continueOnlyStreak += 1;
-      const stallSteps = step - lastLpChangeStep;
-      if (stallSteps >= STALL_STEP_THRESHOLD && continueOnlyStreak >= 500) {
-        throw new Error(
-          `ocgcore CONTINUE stall at LP ${lifePoints[0]}/${lifePoints[1]} (stall_steps=${stallSteps}).`,
-        );
+      const silenceMs = Date.now() - lastDuelOutboundAt;
+      if (silenceMs >= ENGINE_SILENCE_MS) {
+        finishEngineStall({
+          lifePoints,
+          decisions,
+          duelTurn,
+          stallSteps,
+          continueOnlyStreak,
+          silenceMs,
+        });
+        return;
+      }
+      if (continueOnlyStreak % 2_000 === 0) {
+        emitLog({
+          event: "engine_continue",
+          step,
+          continue_only_streak: continueOnlyStreak,
+          stall_steps: stallSteps,
+          silence_ms: silenceMs,
+        });
+      }
+      if (continueOnlyStreak >= CONTINUE_ONLY_STREAK_LIMIT) {
+        finishEngineStall({
+          lifePoints,
+          decisions,
+          duelTurn,
+          stallSteps,
+          continueOnlyStreak,
+          silenceMs,
+          reason: "continue_only_streak",
+        });
+        return;
+      }
+      if (stallSteps >= STALL_STEP_THRESHOLD && continueOnlyStreak >= CONTINUE_STALL_STREAK) {
+        finishEngineStall({
+          lifePoints,
+          decisions,
+          duelTurn,
+          stallSteps,
+          continueOnlyStreak,
+          silenceMs,
+          reason: "continue_stall",
+        });
+        return;
       }
       continue;
     }
@@ -180,42 +309,309 @@ async function runDuel() {
       throw new Error(`Unknown ocgcore process result: ${status}`);
     }
 
-    const stallSteps = step - lastLpChangeStep;
     const forceProactive = stallSteps >= STALL_STEP_THRESHOLD;
+    const hasRetry = messages.some((message) => message.type === OcgMessageType.RETRY);
+    const retryPending = retryQueue.length > 0;
 
-    const selectable = [...messages].reverse().find((message) => legalActionsFor(message, lifePoints).length > 0);
-    if (!selectable) {
-      if (messages.some((message) => message.type === OcgMessageType.RETRY)) {
-        retryOnlySteps += 1;
-        if (retryOnlySteps >= STALL_STEP_THRESHOLD) {
-          throw new Error(
-            `ocgcore RETRY stall at LP ${lifePoints[0]}/${lifePoints[1]} (retry_only_steps=${retryOnlySteps}).`,
-          );
-        }
-        if (retryQueue.length > 0) {
-          const retryAction = retryQueue.shift();
-          emitLog({ event: "retry_response", action: safe(retryAction) });
+    if (hasRetry) {
+      const activeRetryPrompt = activePromptFromMessages(promptMessages);
+      if (
+        activeRetryPrompt
+        && lastPromptContext
+        && activeRetryPrompt.type !== lastPromptContext.messageType
+      ) {
+        retryQueue = [];
+        lastPromptContext = refreshPromptContext(lastPromptContext, promptMessages, lifePoints);
+      }
+      const autoDuringRetry = tryAutoRespond(promptMessages, lifePoints, { retryPass: true });
+      if (autoDuringRetry) {
+        emitLog({
+          event: "retry_auto_response",
+          reason: autoDuringRetry.reason,
+          action: safe({ ...autoDuringRetry.action, response: undefined }),
+        });
+        lib.duelSetResponse(handle, autoDuringRetry.action.response);
+        continue;
+      }
+      if (retryQueue.length > 0 && lastPromptContext?.messageType !== OcgMessageType.SELECT_CARD) {
+        const retryAction = retryQueue.shift();
+        lastPromptContext.triedKeys ??= new Set();
+        lastPromptContext.triedKeys.add(responseKey(retryAction));
+        emitLog({
+          event: "retry_agent_alternate",
+          prompt_type: lastPromptContext.messageType,
+          remaining: retryQueue.length,
+          action: safe({ ...retryAction, response: undefined }),
+        });
+        lib.duelSetResponse(handle, retryAction.response);
+        continue;
+      }
+      const selectCardRetry = lastPromptContext?.messageType === OcgMessageType.SELECT_CARD;
+      if (selectCardRetry && lastPromptContext) {
+        const remainingSelect = remainingRetryActions(lastPromptContext);
+        if (remainingSelect.length > 0) {
+          lastPromptContext.selectRetries = (lastPromptContext.selectRetries ?? 0) + 1;
+          const retryAction = remainingSelect[0];
+          lastPromptContext.triedKeys.add(responseKey(retryAction));
+          emitLog({
+            event: "retry_select_card",
+            remaining: remainingSelect.length - 1,
+            attempt: lastPromptContext.selectRetries,
+            action: safe({ ...retryAction, response: undefined }),
+          });
           lib.duelSetResponse(handle, retryAction.response);
           continue;
         }
-        const fallback = pickSafeRetryResponse(messages, {
-          preferYes: forceProactive || retryOnlySteps > 200,
+        const codeRetry = nextSelectCardCodeRetry(lastPromptContext);
+        if (codeRetry) {
+          emitLog({ event: "retry_code_response", action: safe({ ...codeRetry, response: undefined }) });
+          lib.duelSetResponse(handle, codeRetry.response);
+          continue;
+        }
+        if (!lastPromptContext.forceCancelTried) {
+          lastPromptContext.forceCancelTried = true;
+          emitLog({
+            event: "retry_select_card_cancel",
+            retries: lastPromptContext.selectRetries ?? 0,
+            can_cancel: Boolean(lastPromptContext.selectable?.can_cancel),
+          });
+          lib.duelSetResponse(handle, { type: OcgResponseType.SELECT_CARD, indicies: null });
+          continue;
+        }
+        emitLog({
+          event: "retry_stuck_end",
+          retry_only_steps: retryOnlySteps,
+          decisions,
+          duel_turn: duelTurn,
+          last_prompt_type: lastPromptContext.messageType,
+          last_select_card: {
+            pick_count: selectCardPickCount(enrichSelectCardMessage(lastPromptContext.selectable)),
+            cards: (lastPromptContext.selects ?? []).map((card, index) => ({
+              index,
+              code: Number(card.code ?? 0),
+              name: cardName(Number(card.code ?? 0)),
+            })),
+            tried_index_responses: lastPromptContext.triedKeys?.size ?? 0,
+            tried_code_responses: lastPromptContext.codeTriedKeys?.size ?? 0,
+          },
         });
-        if (fallback) {
+        const lpOutcome = outcomeFromLifePoints(lifePoints);
+        emitResult({
+          winner: lpOutcome?.winner ?? null,
+          loser: lpOutcome?.loser ?? null,
+          turns: Math.max(1, duelTurn),
+          decisions,
+          end_reason: "retry_stuck",
+          life_points: [...lifePoints],
+          tags: ["edopro", "ocgcore-wasm", "retry_stuck"],
+          script_stats: scriptLoadStats,
+        });
+        return;
+      }
+
+      if (lastPromptContext && isPromptRetryType(lastPromptContext.messageType)) {
+        lastPromptContext = refreshPromptContext(lastPromptContext, promptMessages, lifePoints);
+        if ((lastPromptContext.promptRetries ?? 0) >= MAX_PROMPT_RETRIES_PER_PROMPT) {
+          const passiveForced = passivePromptRetryAction(lastPromptContext);
+          if (passiveForced) {
+            emitLog({ event: "retry_prompt_cap_passive", attempt: lastPromptContext.promptRetries });
+            lib.duelSetResponse(handle, passiveForced.response);
+            continue;
+          }
+          emitPromptRetryStuckEnd(lastPromptContext, { retryOnlySteps, decisions, duelTurn, messages });
+          const lpOutcome = outcomeFromLifePoints(lifePoints);
+          emitResult({
+            winner: lpOutcome?.winner ?? null,
+            loser: lpOutcome?.loser ?? null,
+            turns: Math.max(1, duelTurn),
+            decisions,
+            end_reason: "retry_stuck",
+            life_points: [...lifePoints],
+            tags: ["edopro", "ocgcore-wasm", "retry_stuck"],
+            script_stats: scriptLoadStats,
+          });
+          return;
+        }
+        let remainingPrompt = remainingPromptRetryActions(lastPromptContext);
+        if (remainingPrompt.length === 0) {
+          remainingPrompt = remainingAnnounceCardRetryVariants(lastPromptContext);
+        }
+        if (remainingPrompt.length === 0) {
+          remainingPrompt = remainingBattlecmdRetryVariants(lastPromptContext);
+        }
+        if (remainingPrompt.length > 0) {
+          lastPromptContext.promptRetries = (lastPromptContext.promptRetries ?? 0) + 1;
+          const retryAction = remainingPrompt[0];
+          lastPromptContext.triedKeys.add(responseKey(retryAction));
+          emitLog({
+            event: "retry_prompt_action",
+            prompt_type: lastPromptContext.messageType,
+            remaining: remainingPrompt.length - 1,
+            attempt: lastPromptContext.promptRetries,
+            action: safe({ ...retryAction, response: undefined }),
+          });
+          lib.duelSetResponse(handle, retryAction.response);
+          continue;
+        }
+        const passive = passivePromptRetryAction(lastPromptContext);
+        if (passive) {
+          emitLog({
+            event: "retry_prompt_passive",
+            prompt_type: lastPromptContext.messageType,
+            action: safe({ ...passive, response: undefined }),
+          });
+          lib.duelSetResponse(handle, passive.response);
+          continue;
+        }
+        emitPromptRetryStuckEnd(lastPromptContext, { retryOnlySteps, decisions, duelTurn, messages });
+        const lpOutcome = outcomeFromLifePoints(lifePoints);
+        emitResult({
+          winner: lpOutcome?.winner ?? null,
+          loser: lpOutcome?.loser ?? null,
+          turns: Math.max(1, duelTurn),
+          decisions,
+          end_reason: "retry_stuck",
+          life_points: [...lifePoints],
+          tags: ["edopro", "ocgcore-wasm", "retry_stuck"],
+          script_stats: scriptLoadStats,
+        });
+        return;
+      }
+
+      retryOnlySteps += 1;
+      const unhandled = findUnhandledPrompt(messages, lifePoints);
+      if (unhandled) {
+        throw new Error(
+          `Unhandled ocgcore prompt ${ocgMessageTypeStrings.get(unhandled.type) ?? unhandled.type}: ${JSON.stringify(safe(unhandled))}`,
+        );
+      }
+      if (retryOnlySteps >= RETRY_STALL_THRESHOLD) {
+        throw new Error(
+          `ocgcore RETRY stall at LP ${lifePoints[0]}/${lifePoints[1]} (retry_only_steps=${retryOnlySteps}, messages=${JSON.stringify(safe(messages))}).`,
+        );
+      }
+      if (retryQueue.length > 0) {
+        const retryAction = retryQueue.shift();
+        emitLog({ event: "retry_response", action: safe(retryAction) });
+        lib.duelSetResponse(handle, retryAction.response);
+        continue;
+      }
+      const contextRetry = nextRetryFromContext(lastPromptContext);
+      if (contextRetry) {
+        emitLog({ event: "retry_context_fallback", action: safe({ ...contextRetry, response: undefined }) });
+        lib.duelSetResponse(handle, contextRetry.response);
+        continue;
+      }
+      const fallback = pickSafeRetryResponse(messages, {
+        preferYes: false,
+        context: lastPromptContext,
+      });
+      if (fallback) {
+        lastPromptContext ??= { triedKeys: new Set(), legalActions: [] };
+        const key = responseKey(fallback);
+        if (!lastPromptContext.triedKeys.has(key)) {
+          lastPromptContext.triedKeys.add(key);
           emitLog({ event: "retry_safe_fallback", response: safe({ ...fallback, response: undefined }) });
           lib.duelSetResponse(handle, fallback.response);
           continue;
         }
-        throw new Error(
-          `ocgcore requested RETRY but no alternate responses remain: ${JSON.stringify(safe(messages))}`,
-        );
+      }
+      emitPromptRetryStuckEnd(lastPromptContext, { retryOnlySteps, decisions, duelTurn, messages });
+      const lpOutcome = outcomeFromLifePoints(lifePoints);
+      emitResult({
+        winner: lpOutcome?.winner ?? null,
+        loser: lpOutcome?.loser ?? null,
+        turns: Math.max(1, duelTurn),
+        decisions,
+        end_reason: "retry_stuck",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "retry_stuck"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
+
+    // While waiting for a RETRY after an agent response, only answer mandatory
+    // hand-order prompts; other auto prompts would clobber retry context.
+    const blockAutoRespond = (hasRetry && lastPromptContext?.messageType === OcgMessageType.SELECT_CARD)
+      || (retryPending && lastPromptContext?.messageType === OcgMessageType.SELECT_CARD);
+    const autoResponse = blockAutoRespond ? null : tryAutoRespond(messages, lifePoints);
+    if (autoResponse) {
+      if (autoResponse.action?.response && !retryPending) {
+        lastPromptContext = {
+          messageType: autoResponse.message.type,
+          selectable: autoResponse.message,
+          legalActions: autoResponse.legalActions.map((candidate) => ({ ...candidate })),
+          triedKeys: new Set([responseKey(autoResponse.action)]),
+        };
+      }
+      emitLog({
+        event: "auto_response",
+        reason: autoResponse.reason,
+        action: safe({ ...autoResponse.action, response: undefined }),
+      });
+      lib.duelSetResponse(handle, autoResponse.action.response);
+      continue;
+    }
+
+    if (maxDuelTurns > 0 && duelTurn > maxDuelTurns) {
+      const forced = outcomeFromTurnLimit(lifePoints);
+      emitLog({
+        event: "max_duel_turns_reached",
+        max_duel_turns: maxDuelTurns,
+        duel_turn: duelTurn,
+        life_points: [...lifePoints],
+      });
+      emitResult({
+        winner: forced.winner,
+        loser: forced.loser,
+        turns: duelTurn,
+        decisions,
+        end_reason: "turn_limit",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "turn_limit"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
+
+    const selectable = [...messages].reverse().find((message) => {
+      if (retryPending && message.type === OcgMessageType.SORT_CARD) {
+        return false;
+      }
+      return legalActionsFor(message, lifePoints).length > 0;
+    });
+    if (!selectable) {
+      if (retryPending && !hasRetry) {
+        retryOnlySteps += 1;
+        if (retryOnlySteps >= RETRY_PENDING_SPIN_LIMIT) {
+          finishEngineStall({
+            lifePoints,
+            decisions,
+            duelTurn,
+            stallSteps,
+            continueOnlyStreak,
+            silenceMs: Date.now() - lastDuelOutboundAt,
+            reason: "retry_pending_spin",
+          });
+          return;
+        }
+        continue;
       }
       throw new Error(`ocgcore is waiting, but no supported selectable message was emitted: ${JSON.stringify(safe(messages))}`);
     }
     retryOnlySteps = 0;
 
     const legalActions = legalActionsFor(selectable, lifePoints);
-    if (forceProactive) {
+    const idleStallBreak = stallSteps >= STALL_IDLE_AGENT_THRESHOLD
+      && (selectable.type === OcgMessageType.SELECT_IDLECMD
+        || selectable.type === OcgMessageType.SELECT_BATTLECMD);
+    if (
+      forceProactive
+      && !idleStallBreak
+      && selectable.type !== OcgMessageType.SELECT_IDLECMD
+      && selectable.type !== OcgMessageType.SELECT_BATTLECMD
+    ) {
       const stallBreaker = chooseProactiveAction(legalActions)
         ?? chooseLeastPassiveAction(legalActions, { skipPhasePass: true });
       emitLog({
@@ -227,8 +623,8 @@ async function runDuel() {
       lib.duelSetResponse(handle, stallBreaker.response);
       continue;
     }
-    const autoPass = chooseAutoPassAction(legalActions);
-    if (autoPass && !forceProactive) {
+    const autoPass = chooseAutoPassAction(legalActions, { stallSteps });
+    if (autoPass && !forceProactive && !idleStallBreak) {
       emitLog({
         event: "auto_pass_turn",
         selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
@@ -238,20 +634,18 @@ async function runDuel() {
       continue;
     }
 
-    if (decisions >= maxDecisions) {
-      const forced = outcomeFromLifePoints(lifePoints) ?? {
-        winner: playerName(0),
-        loser: playerName(1),
-      };
+    if (maxDecisions > 0 && decisions >= maxDecisions) {
+      const forced = outcomeFromTurnLimit(lifePoints);
       emitLog({
         event: "max_decisions_reached",
         max_decisions: maxDecisions,
+        duel_turn: duelTurn,
         life_points: [...lifePoints],
       });
       emitResult({
         winner: forced.winner,
         loser: forced.loser,
-        turns: countTurns(messages),
+        turns: Math.max(1, duelTurn),
         decisions,
         end_reason: "max_decisions",
         life_points: [...lifePoints],
@@ -260,37 +654,72 @@ async function runDuel() {
       });
       return;
     }
+    if (maxDecisions === 0 && decisions >= SOFT_MAX_DECISIONS_UNLIMITED) {
+      const forced = outcomeFromTurnLimit(lifePoints);
+      emitLog({
+        event: "soft_decision_cap",
+        decisions,
+        duel_turn: duelTurn,
+        life_points: [...lifePoints],
+      });
+      emitResult({
+        winner: forced.winner,
+        loser: forced.loser,
+        turns: Math.max(1, duelTurn),
+        decisions,
+        end_reason: "engine_stall",
+        life_points: [...lifePoints],
+        tags: ["edopro", "ocgcore-wasm", "decision_cap"],
+        script_stats: scriptLoadStats,
+      });
+      return;
+    }
 
     decisions += 1;
+    lastDuelOutboundAt = Date.now();
+    retryQueue = [];
     const stateId = `ocgcore-${decisions}`;
-    emitLog({
-      event: "decision_state",
-      state_id: stateId,
-      selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
-      player: selectable.player,
-      legal_action_ids: legalActions.map((action) => action.action_id),
-    });
-    emit({
-      type: "state",
-      state: {
+    let action;
+    let requestedAction;
+    let actionMessage;
+    if (selectable.type === OcgMessageType.SELECT_CARD) {
+      const enriched = enrichSelectCardMessage(selectable);
+      action = chooseBestSelectCardAction(legalActions, enriched);
+      requestedAction = action;
+      actionMessage = { action_id: action.action_id };
+      emitLog({
+        event: "auto_select_card",
         state_id: stateId,
-        turn: decisions,
-        active_player: playerName(selectable.player ?? 0),
-        summary: summarizeMessage(selectable, lifePoints),
-        legal_actions: legalActions.map(({ response: _response, ...action }) => action),
-        public_zones: visibleZonesFor(selectable.player ?? 0, lifePoints),
-      },
-    });
-
-    const actionMessage = await readJsonLine();
-    const actionIndex = legalActions.findIndex((candidate) => candidate.action_id === actionMessage.action_id);
-    const requestedAction = legalActions[actionIndex];
-    if (!requestedAction) {
-      throw new Error(`Unknown action_id ${actionMessage.action_id} for state ${stateId}.`);
+        selected_action: safe({ ...action, response: undefined }),
+      });
+    } else {
+      const prompted = await promptAgentForActions({
+        stateId,
+        selectable,
+        legalActions,
+        lifePoints,
+        duelTurn,
+        decisions,
+        reason: "decision",
+      });
+      action = prompted.action;
+      requestedAction = prompted.requestedAction;
+      actionMessage = prompted.actionMessage;
     }
-    const action = forceLpPressureAction(legalActions, requestedAction) ?? requestedAction;
-    const effectiveIndex = legalActions.findIndex((candidate) => candidate.action_id === action.action_id);
-    retryQueue = legalActions.filter((_candidate, index) => index !== effectiveIndex);
+    retryQueue = retryAlternatesFor(legalActions, action);
+    lastPromptContext = {
+      messageType: selectable.type,
+      selectable,
+      selects: selectable.type === OcgMessageType.SELECT_CARD
+        ? (enrichSelectCardMessage(selectable).selects ?? [])
+        : [],
+      legalActions: legalActions.map((candidate) => ({ ...candidate })),
+      triedKeys: new Set([responseKey(action)]),
+      promptRevision: promptRevision(selectable),
+      codeTriedKeys: new Set(),
+      selectRetries: 0,
+      forceCancelTried: false,
+    };
     emitLog({
       event: "submit_response",
       state_id: stateId,
@@ -377,9 +806,14 @@ function forceLpPressureAction(legalActions, requestedAction) {
   if (toBattle && requestedAction.action_id === "to-end-phase") {
     return toBattle;
   }
-  const summon = legalActions.find((action) => action.action_id.startsWith("normal-summon-"));
+  const summon = legalActions.find((action) => action.action_id.startsWith("normal-summon-"))
+    ?? legalActions.find((action) => action.action_id.startsWith("special-summon-"));
   if (summon && requestedAction.action_id.startsWith("set-")) {
     return summon;
+  }
+  const activate = legalActions.find((action) => action.action_id.startsWith("activate-"));
+  if (activate && requestedAction.action_id.startsWith("set-")) {
+    return activate;
   }
   return null;
 }
@@ -408,7 +842,541 @@ function outcomeFromLifePoints(lifePoints) {
   return null;
 }
 
-function pickSafeRetryResponse(messages, { preferYes = false } = {}) {
+function finishEngineStall({
+  lifePoints,
+  decisions,
+  duelTurn,
+  stallSteps,
+  continueOnlyStreak,
+  silenceMs,
+  reason = "engine_silence",
+}) {
+  const forced = outcomeFromTurnLimit(lifePoints);
+  emitLog({
+    event: "engine_stall",
+    reason,
+    stall_steps: stallSteps,
+    continue_only_streak: continueOnlyStreak,
+    silence_ms: silenceMs,
+    life_points: [...lifePoints],
+  });
+  emitResult({
+    winner: forced.winner,
+    loser: forced.loser,
+    turns: Math.max(1, duelTurn),
+    decisions,
+    end_reason: "engine_stall",
+    life_points: [...lifePoints],
+    tags: ["edopro", "ocgcore-wasm", "engine_stall"],
+    script_stats: scriptLoadStats,
+  });
+}
+
+function outcomeFromTurnLimit(lifePoints) {
+  const lpOutcome = outcomeFromLifePoints(lifePoints);
+  if (lpOutcome) {
+    return lpOutcome;
+  }
+  if (lifePoints[0] === lifePoints[1]) {
+    return { winner: null, loser: null };
+  }
+  if (lifePoints[0] > lifePoints[1]) {
+    return { winner: playerName(0), loser: playerName(1) };
+  }
+  return { winner: playerName(1), loser: playerName(0) };
+}
+
+function findUnhandledPrompt(messages, lifePoints) {
+  for (const message of messages) {
+    if (message.type === OcgMessageType.RETRY) {
+      continue;
+    }
+    if (!PROMPT_MESSAGE_TYPES.has(message.type)) {
+      continue;
+    }
+    if (legalActionsFor(message, lifePoints).length > 0) {
+      continue;
+    }
+    return message;
+  }
+  return null;
+}
+
+function tryAutoRespond(messages, lifePoints, { sortOnly = false, retryPass = false } = {}) {
+  const autoTypes = sortOnly
+    ? [OcgMessageType.SORT_CARD]
+    : [
+      OcgMessageType.SORT_CARD,
+      OcgMessageType.SORT_CHAIN,
+      OcgMessageType.SELECT_COUNTER,
+      OcgMessageType.SELECT_SUM,
+      OcgMessageType.SELECT_OPTION,
+      OcgMessageType.ANNOUNCE_NUMBER,
+      OcgMessageType.ANNOUNCE_RACE,
+      OcgMessageType.ANNOUNCE_ATTRIB,
+      OcgMessageType.ANNOUNCE_CARD,
+    ];
+  if (retryPass) {
+    autoTypes.push(
+      OcgMessageType.SELECT_PLACE,
+      OcgMessageType.SELECT_DISFIELD,
+      OcgMessageType.SELECT_POSITION,
+      OcgMessageType.SELECT_YESNO,
+      OcgMessageType.SELECT_EFFECTYN,
+      OcgMessageType.SELECT_TRIBUTE,
+    );
+  }
+  for (const type of autoTypes) {
+    const message = [...messages].reverse().find((entry) => entry.type === type);
+    if (!message) {
+      continue;
+    }
+    const actions = legalActionsFor(message, lifePoints);
+    if (actions.length === 0) {
+      continue;
+    }
+    const action = pickRetryAutoAction(type, actions, message);
+    if (!action) {
+      continue;
+    }
+    return {
+      reason: ocgMessageTypeStrings.get(type) ?? type,
+      message,
+      legalActions: actions,
+      action,
+    };
+  }
+  if (retryPass) {
+    const chainMessage = [...messages].reverse().find((entry) => entry.type === OcgMessageType.SELECT_CHAIN);
+    if (chainMessage) {
+      const actions = legalActionsFor(chainMessage, lifePoints);
+      const decline = actions.find((candidate) => candidate.action_id === "decline-chain");
+      const action = decline ?? actions[0];
+      if (action) {
+        return {
+          reason: ocgMessageTypeStrings.get(OcgMessageType.SELECT_CHAIN) ?? OcgMessageType.SELECT_CHAIN,
+          message: chainMessage,
+          legalActions: actions,
+          action,
+        };
+      }
+    }
+    const unselectMessage = [...messages].reverse().find(
+      (entry) => entry.type === OcgMessageType.SELECT_UNSELECT_CARD,
+    );
+    if (unselectMessage) {
+      const actions = legalActionsFor(unselectMessage, lifePoints);
+      const finish = actions.find((candidate) => candidate.action_id === "finish-selection");
+      const cancel = actions.find((candidate) => candidate.action_id === "cancel-selection");
+      const action = finish ?? cancel ?? actions[0];
+      if (action) {
+        return {
+          reason: ocgMessageTypeStrings.get(OcgMessageType.SELECT_UNSELECT_CARD)
+            ?? OcgMessageType.SELECT_UNSELECT_CARD,
+          message: unselectMessage,
+          legalActions: actions,
+          action,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function pickRetryAutoAction(type, actions, message) {
+  if (type === OcgMessageType.SELECT_PLACE || type === OcgMessageType.SELECT_DISFIELD) {
+    return actions[0];
+  }
+  if (type === OcgMessageType.SELECT_POSITION) {
+    return actions[0];
+  }
+  if (type === OcgMessageType.SELECT_YESNO) {
+    return actions.find((candidate) => candidate.action_id === "no") ?? actions[0];
+  }
+  if (type === OcgMessageType.SELECT_EFFECTYN) {
+    return actions.find((candidate) => candidate.action_id === "decline-effect") ?? actions[0];
+  }
+  if (type === OcgMessageType.SELECT_TRIBUTE) {
+    return actions[0];
+  }
+  if (type === OcgMessageType.ANNOUNCE_CARD) {
+    const real = actions.find((action) => !action.action_id.includes("fallback"));
+    return real ?? actions[0];
+  }
+  return actions[0];
+}
+
+function enrichSelectCardMessage(message) {
+  if (!lib || !handle || message.type !== OcgMessageType.SELECT_CARD) {
+    return message;
+  }
+  const selects = (message.selects ?? []).map((card) => {
+    try {
+      const info = lib.duelQuery(handle, {
+        flags: OcgQueryFlags.CODE,
+        controller: card.controller,
+        location: card.location,
+        sequence: card.sequence,
+      });
+      if (info?.code) {
+        return { ...card, code: info.code };
+      }
+    } catch (_error) {
+      // keep parsed card when query fails
+    }
+    return card;
+  });
+  return { ...message, selects };
+}
+
+function responseKey(responseOrAction) {
+  const action = responseOrAction?.response != null ? responseOrAction : null;
+  const response = action?.response ?? responseOrAction;
+  const actionId = action?.action_id ?? null;
+  return JSON.stringify(
+    { action_id: actionId, response },
+    (_key, value) => (typeof value === "bigint" ? value.toString() : value),
+  );
+}
+
+function retryAlternatesFor(legalActions, chosenAction) {
+  const chosenKey = responseKey(chosenAction);
+  return legalActions.filter((candidate) => responseKey(candidate) !== chosenKey);
+}
+
+function resolvePromptMessages(messages, lastObservable) {
+  const live = messages.filter((message) => message.type !== OcgMessageType.RETRY);
+  if (live.length > 0) {
+    return messages;
+  }
+  return lastObservable.length > 0 ? lastObservable : messages;
+}
+
+function activePromptFromMessages(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.type === OcgMessageType.RETRY) {
+      continue;
+    }
+    if (PROMPT_MESSAGE_TYPES.has(message.type)) {
+      return message;
+    }
+  }
+  return null;
+}
+
+function opponentFieldHasMonsters(activePlayer) {
+  if (!lib || !handle) {
+    return false;
+  }
+  const opponent = activePlayer === 0 ? 1 : 0;
+  for (let sequence = 0; sequence < 7; sequence += 1) {
+    try {
+      const info = lib.duelQuery(handle, {
+        flags: OcgQueryFlags.CODE,
+        controller: opponent,
+        location: OcgLocation.MZONE,
+        sequence,
+      });
+      if (info?.code) {
+        return true;
+      }
+    } catch (_error) {
+      // ignore missing zones
+    }
+  }
+  return false;
+}
+
+function isPromptRetryType(messageType) {
+  return PROMPT_MESSAGE_TYPES.has(messageType)
+    && messageType !== OcgMessageType.SELECT_CARD;
+}
+
+function promptRevision(message) {
+  if (!message) {
+    return "";
+  }
+  switch (message.type) {
+    case OcgMessageType.SELECT_IDLECMD:
+      return [
+        message.player,
+        message.summons?.length ?? 0,
+        message.special_summons?.length ?? 0,
+        message.pos_changes?.length ?? 0,
+        message.activates?.length ?? 0,
+        message.monster_sets?.length ?? 0,
+        message.spell_sets?.length ?? 0,
+        message.shuffle ? 1 : 0,
+        message.to_bp ? 1 : 0,
+        message.to_ep ? 1 : 0,
+      ].join(":");
+    case OcgMessageType.SELECT_BATTLECMD:
+      return [
+        message.player,
+        message.attacks?.length ?? 0,
+        message.chains?.length ?? 0,
+        message.to_ep ? 1 : 0,
+        message.to_m2 ? 1 : 0,
+      ].join(":");
+    case OcgMessageType.SELECT_CHAIN:
+      return [
+        message.forced ? 1 : 0,
+        message.selects?.length ?? 0,
+        (message.selects ?? []).map((card) => Number(card.code ?? 0)).join(","),
+      ].join(":");
+    case OcgMessageType.SELECT_PLACE:
+    case OcgMessageType.SELECT_DISFIELD:
+      return [message.player, message.field_mask >>> 0, message.count ?? 0].join(":");
+    case OcgMessageType.SELECT_UNSELECT_CARD:
+      return [
+        message.select_cards?.length ?? 0,
+        message.unselect_cards?.length ?? 0,
+        message.can_cancel ? 1 : 0,
+        message.can_finish ? 1 : 0,
+      ].join(":");
+    case OcgMessageType.ANNOUNCE_CARD:
+      return [
+        message.player,
+        message.opcodes?.length ?? 0,
+        (message.opcodes ?? []).map((opcode) => String(opcode)).join(","),
+      ].join(":");
+    default:
+      return `${message.type}:${message.player ?? ""}`;
+  }
+}
+
+function refreshPromptContext(context, messages, lifePoints) {
+  if (!context) {
+    return context;
+  }
+  const prompt = activePromptFromMessages(messages);
+  if (!prompt) {
+    return context;
+  }
+  const legalActions = legalActionsFor(prompt, lifePoints);
+  if (!legalActions.length) {
+    return context;
+  }
+  const revision = promptRevision(prompt);
+  const promptChanged = prompt.type !== context.messageType || revision !== context.promptRevision;
+  return {
+    ...context,
+    messageType: prompt.type,
+    selectable: prompt,
+    promptRevision: revision,
+    legalActions: legalActions.map((candidate) => ({ ...candidate })),
+    triedKeys: promptChanged ? new Set() : (context.triedKeys ?? new Set()),
+    promptRetries: promptChanged ? 0 : (context.promptRetries ?? 0),
+    agentRetryReprompt: promptChanged ? false : context.agentRetryReprompt,
+  };
+}
+
+function promptRetryPriority(action) {
+  const id = action.action_id;
+  if (id === "no" || id === "decline-effect" || id === "decline-chain") {
+    return 0;
+  }
+  if (id === "cancel-selection" || id === "finish-selection") {
+    return 5;
+  }
+  if (id === "to-end-phase" || id === "to-main-phase-2") {
+    return 10;
+  }
+  if (id === "to-battle-phase") {
+    return 15;
+  }
+  if ((action.tags ?? []).includes("decline")) {
+    return 20;
+  }
+  if (id.startsWith("unselect-")) {
+    return 200;
+  }
+  if (id.startsWith("select-unselect-")) {
+    return 250;
+  }
+  if (id.startsWith("set-")) {
+    return 400;
+  }
+  if (id.startsWith("pos-change-")) {
+    return 420;
+  }
+  if (id === "shuffle-hand") {
+    return 425;
+  }
+  if (id.startsWith("option-")) {
+    return 450;
+  }
+  if (id.startsWith("place-")) {
+    return 480;
+  }
+  if (id.startsWith("position-")) {
+    return 490;
+  }
+  if (id.startsWith("chain-") || id.startsWith("battle-chain-")) {
+    return 600;
+  }
+  if (id.startsWith("special-summon-") || id.startsWith("normal-summon-")) {
+    return 750;
+  }
+  if (id.startsWith("attack-")) {
+    return 800;
+  }
+  if (id.startsWith("activate-") || id === "activate-effect") {
+    return 900;
+  }
+  return 500;
+}
+
+function remainingPromptRetryActions(context) {
+  const remaining = remainingRetryActions(context);
+  return remaining.sort((left, right) => promptRetryPriority(left) - promptRetryPriority(right));
+}
+
+function remainingAnnounceCardRetryVariants(context) {
+  if (context?.messageType !== OcgMessageType.ANNOUNCE_CARD || !context.selectable) {
+    return [];
+  }
+  context.triedKeys ??= new Set();
+  const refreshed = legalActionsFor(context.selectable, [8000, 8000]);
+  const remaining = refreshed.filter((action) => !context.triedKeys.has(responseKey(action)));
+  return remaining.sort((left, right) => cardName(left.response?.card ?? 0).localeCompare(cardName(right.response?.card ?? 0)));
+}
+
+function remainingBattlecmdRetryVariants(context) {
+  if (context?.messageType !== OcgMessageType.SELECT_BATTLECMD || !context.legalActions?.length) {
+    return [];
+  }
+  context.triedKeys ??= new Set();
+  const variants = [];
+  for (const action of context.legalActions) {
+    if (action.response?.type !== OcgResponseType.SELECT_BATTLECMD) {
+      continue;
+    }
+    const alternates = battlecmdResponseAlternates(action.response);
+    for (const [alternateIndex, response] of alternates.entries()) {
+      if (alternateIndex === 0) {
+        continue;
+      }
+      const candidate = {
+        ...action,
+        action_id: `${action.action_id}~alt${alternateIndex}`,
+        response,
+      };
+      if (!context.triedKeys.has(responseKey(candidate))) {
+        variants.push(candidate);
+      }
+    }
+  }
+  return variants.sort((left, right) => promptRetryPriority(left) - promptRetryPriority(right));
+}
+
+function battlecmdResponseAlternates(response) {
+  if (response?.type !== OcgResponseType.SELECT_BATTLECMD) {
+    return [response];
+  }
+  const alternates = [response];
+  const indexVariants = response.action === SelectBattleCMDAction.SELECT_BATTLE
+    ? [response.index, 0]
+    : [null, 0, -1];
+  const baseKey = responseKey({ action_id: "battlecmd", response });
+  for (const index of indexVariants) {
+    const candidate = { ...response, index };
+    if (responseKey({ action_id: "battlecmd", response: candidate }) !== baseKey) {
+      alternates.push(candidate);
+    }
+  }
+  return alternates;
+}
+
+async function tryAgentRetryRechoose(_args) {
+  // Disabled during training: re-prompting the Python agent on RETRY adds IPC churn and
+  // can look like a hung job when the engine is only cycling retries.
+  return null;
+}
+
+function passivePromptRetryAction(context) {
+  if (!context?.legalActions?.length) {
+    return null;
+  }
+  context.triedKeys ??= new Set();
+  const preferredIds = [
+    "no",
+    "decline-effect",
+    "decline-chain",
+    "cancel-selection",
+    "finish-selection",
+    "to-end-phase",
+    "to-main-phase-2",
+    "to-battle-phase",
+  ];
+  for (const actionId of preferredIds) {
+    const action = context.legalActions.find((candidate) => candidate.action_id === actionId);
+    if (!action) {
+      continue;
+    }
+    const key = responseKey(action);
+    if (context.triedKeys.has(key)) {
+      continue;
+    }
+    context.triedKeys.add(key);
+    return action;
+  }
+  for (const action of context.legalActions) {
+    if (!(action.tags ?? []).includes("decline")) {
+      continue;
+    }
+    const key = responseKey(action);
+    if (context.triedKeys.has(key)) {
+      continue;
+    }
+    context.triedKeys.add(key);
+    return action;
+  }
+  return null;
+}
+
+function emitPromptRetryStuckEnd(context, { retryOnlySteps, decisions, duelTurn, messages = [] }) {
+  const messageTypes = messages.map((message) => ocgMessageTypeStrings.get(message.type) ?? message.type);
+  emitLog({
+    event: "retry_stuck_end",
+    retry_only_steps: retryOnlySteps,
+    decisions,
+    duel_turn: duelTurn,
+    last_prompt_type: context?.messageType ?? null,
+    last_prompt_name: context?.messageType != null
+      ? (ocgMessageTypeStrings.get(context.messageType) ?? context.messageType)
+      : null,
+    prompt_revision: context?.promptRevision ?? null,
+    legal_action_count: context?.legalActions?.length ?? 0,
+    tried_responses: context?.triedKeys?.size ?? 0,
+    message_types: messageTypes,
+    pending_action_ids: (context?.legalActions ?? [])
+      .filter((action) => !context?.triedKeys?.has(responseKey(action)))
+      .map((action) => action.action_id),
+    tried_action_ids: (context?.legalActions ?? [])
+      .filter((action) => context?.triedKeys?.has(responseKey(action)))
+      .map((action) => action.action_id),
+  });
+}
+
+function nextRetryFromContext(context) {
+  if (!context?.legalActions?.length) {
+    return null;
+  }
+  context.triedKeys ??= new Set();
+  for (const action of context.legalActions) {
+    const key = responseKey(action);
+    if (context.triedKeys.has(key)) {
+      continue;
+    }
+    context.triedKeys.add(key);
+    return action;
+  }
+  return null;
+}
+
+function pickSafeRetryResponse(messages, { preferYes = false, context = null } = {}) {
   for (const message of messages) {
     const actions = legalActionsFor(message, [8000, 8000]);
     if (preferYes) {
@@ -425,16 +1393,208 @@ function pickSafeRetryResponse(messages, { preferYes = false } = {}) {
     if (fallbackActions.length > 0) {
       return fallbackActions[0];
     }
+    if (actions.length > 0) {
+      return actions[0];
+    }
   }
-  return {
-    action_id: "retry-decline-effect",
-    label: "Decline effect (retry fallback)",
-    tags: ["effect", "decline"],
-    response: { type: OcgResponseType.SELECT_EFFECTYN, yes: false },
-  };
+  const contextFallback = pickRetryFallbackFromContext(context);
+  if (contextFallback) {
+    return contextFallback;
+  }
+  return null;
 }
 
-function chooseAutoPassAction(legalActions) {
+function selectCardActionSortKey(action, context = null) {
+  if (action.response?.type === OcgResponseType.SELECT_CARD_CODES) {
+    const codes = action.response?.codes ?? [];
+    const selects = context?.selects ?? [];
+    const indices = codes
+      .map((code) => selects.findIndex((card) => Number(card.code ?? 0) === Number(code)))
+      .filter((index) => index >= 0);
+    const tagScore = indices.length ? scoreSelectCombo(selects, indices) : 0;
+    return -20_000 - tagScore;
+  }
+  if (action.action_id.startsWith("select-card-combo-")) {
+    const indices = action.response?.indicies;
+    const selects = context?.selects;
+    if (Array.isArray(indices)) {
+      const indexSum = indices.reduce((sum, index) => sum + index, 0);
+      const tagScore = Array.isArray(selects) ? scoreSelectCombo(selects, indices) : 0;
+      return indexSum * 10 - tagScore;
+    }
+    return 500 + action.action_id.length;
+  }
+  const match = action.action_id.match(/^select-card-(\d+)$/);
+  if (match) {
+    return Number(match[1]);
+  }
+  if (action.action_id === "cancel-select-card") {
+    return 10_000;
+  }
+  return 9_000;
+}
+
+function nextSelectCardCodeRetry(context) {
+  if (context?.messageType !== OcgMessageType.SELECT_CARD) {
+    return null;
+  }
+  context.codeTriedKeys ??= new Set();
+  for (const action of context.legalActions ?? []) {
+    if (action.response?.type !== OcgResponseType.SELECT_CARD_CODES) {
+      continue;
+    }
+    const key = responseKey(action);
+    if (context.codeTriedKeys.has(key)) {
+      continue;
+    }
+    context.codeTriedKeys.add(key);
+    return action;
+  }
+  return null;
+}
+
+function remainingRetryActions(context) {
+  if (!context?.legalActions?.length) {
+    return [];
+  }
+  context.triedKeys ??= new Set();
+  const remaining = context.legalActions.filter(
+    (action) => !context.triedKeys.has(responseKey(action)),
+  );
+  if (context.messageType === OcgMessageType.SELECT_CARD) {
+    return remaining.sort(
+      (left, right) => selectCardActionSortKey(left, context) - selectCardActionSortKey(right, context),
+    );
+  }
+  return remaining;
+}
+
+function pickRetryFallbackFromContext(context) {
+  if (!context?.legalActions?.length) {
+    return null;
+  }
+  context.triedKeys ??= new Set();
+  const cancel = context.legalActions.find(
+    (action) => action.action_id.startsWith("cancel-") || (action.tags ?? []).includes("decline"),
+  );
+  if (cancel) {
+    const key = responseKey(cancel);
+    if (!context.triedKeys.has(key)) {
+      context.triedKeys.add(key);
+      return cancel;
+    }
+  }
+  return nextRetryFromContext(context);
+}
+
+async function promptAgentForActions({
+  stateId,
+  selectable,
+  legalActions,
+  lifePoints,
+  duelTurn,
+  decisions,
+  reason,
+}) {
+  emitLog({
+    event: "decision_state",
+    state_id: stateId,
+    reason,
+    selectable_type: ocgMessageTypeStrings.get(selectable.type) ?? selectable.type,
+    player: selectable.player,
+    legal_action_ids: legalActions.map((action) => action.action_id),
+    ...(selectable.type === OcgMessageType.SELECT_CARD
+      ? {
+        select_card: {
+          min: selectable.min,
+          max: selectable.max,
+          can_cancel: Boolean(selectable.can_cancel),
+          count: selectable.selects?.length ?? 0,
+          codes: (selectable.selects ?? []).map((card) => card.code),
+          locations: (selectable.selects ?? []).map((card) => ({
+            controller: card.controller,
+            location: card.location,
+            sequence: card.sequence,
+          })),
+        },
+      }
+      : {}),
+  });
+  lastDuelOutboundAt = Date.now();
+  emit({
+    type: "state",
+    state: {
+      state_id: stateId,
+      turn: Math.max(1, duelTurn),
+      duel_turn: Math.max(1, duelTurn),
+      decision_index: decisions,
+      active_player: playerName(selectable.player ?? 0),
+      summary: summarizeMessage(selectable, lifePoints),
+      legal_actions: legalActions.map(({ response: _response, ...action }) => action),
+      public_zones: visibleZonesFor(selectable.player ?? 0, lifePoints),
+      ...(selectable.type === OcgMessageType.SELECT_CARD
+        ? {
+          select_card: {
+            min: Number(selectable.min ?? 1),
+            max: Number(selectable.max ?? selectable.min ?? 1),
+            pick_count: selectCardPickCount(selectable),
+            can_cancel: Boolean(selectable.can_cancel),
+            cards: (selectable.selects ?? []).map((card, index) => ({
+              index,
+              code: Number(card.code ?? 0),
+              name: cardName(Number(card.code ?? 0)),
+            })),
+          },
+        }
+        : {}),
+    },
+  });
+
+  const actionMessage = await readJsonLine();
+  const requestedAction = legalActions.find((candidate) => candidate.action_id === actionMessage.action_id);
+  if (!requestedAction) {
+    throw new Error(`Unknown action_id ${actionMessage.action_id} for state ${stateId}.`);
+  }
+  const action = forceLpPressureAction(legalActions, requestedAction) ?? requestedAction;
+  return { action, requestedAction, actionMessage };
+}
+
+function ensureOcgcoreSelectPatch() {
+  const gatewayRoot = path.dirname(fileURLToPath(import.meta.url));
+  const target = path.join(gatewayRoot, "node_modules/ocgcore-wasm/dist/index.js");
+  if (!existsSync(target)) {
+    emitLog({
+      event: "ocgcore_patch_warning",
+      message: "ocgcore-wasm is not installed; run npm install in gateways/edopro-ocgcore.",
+    });
+    return;
+  }
+  const source = readFileSync(target, "utf8");
+  if (source.includes(OCGCORE_SELECT_PATCH_MARKER)) {
+    emitLog({ event: "ocgcore_patch_ok", message: "SELECT_CARD list encoding is active (patch-ocgcore-select.mjs)." });
+    return;
+  }
+  throw new Error(
+    "ocgcore-wasm SELECT_CARD patch is missing. From gateways/edopro-ocgcore run: npm install && node patch-ocgcore-select.mjs",
+  );
+}
+
+function isPressureAction(action) {
+  const tags = action.tags ?? [];
+  const id = action.action_id;
+  if (id.startsWith("attack-") || id.startsWith("normal-summon-") || id.startsWith("special-summon-")) {
+    return true;
+  }
+  if (id.startsWith("activate-") || id === "activate-effect" || id === "to-battle-phase") {
+    return true;
+  }
+  if (tags.includes("lethal") || tags.includes("direct-attack")) {
+    return true;
+  }
+  return id.startsWith("set-monster-");
+}
+
+function chooseAutoPassAction(legalActions, { stallSteps = 0 } = {}) {
   if (!legalActions.length) {
     return null;
   }
@@ -445,11 +1605,15 @@ function chooseAutoPassAction(legalActions) {
     "cancel-",
     "finish-",
   ];
+  const requirePressure = stallSteps >= STALL_IDLE_AGENT_THRESHOLD;
   const hasProactiveAction = legalActions.some((action) => {
+    if (requirePressure && isPressureAction(action)) {
+      return true;
+    }
     const tags = action.tags ?? [];
     const hasActiveTag = tags.some((tag) => !passiveTags.has(tag));
     const hasActivePrefix = !passivePrefixes.some((prefix) => action.action_id.startsWith(prefix));
-    return hasActiveTag && hasActivePrefix;
+    return !requirePressure && hasActiveTag && hasActivePrefix;
   });
   if (hasProactiveAction) {
     return null;
@@ -467,6 +1631,9 @@ function chooseAutoPassAction(legalActions) {
 
 
 function legalActionsFor(message, lifePoints = [8000, 8000]) {
+  if (message.type === OcgMessageType.SELECT_CARD) {
+    message = enrichSelectCardMessage(message);
+  }
   switch (message.type) {
     case OcgMessageType.SELECT_IDLECMD:
       return idleActions(message, lifePoints);
@@ -501,6 +1668,13 @@ function legalActionsFor(message, lifePoints = [8000, 8000]) {
       return fieldPlaceActions(message, OcgResponseType.SELECT_PLACE);
     case OcgMessageType.SELECT_DISFIELD:
       return fieldPlaceActions(message, OcgResponseType.SELECT_DISFIELD);
+    case OcgMessageType.SORT_CARD:
+    case OcgMessageType.SORT_CHAIN:
+      return sortCardActions(message);
+    case OcgMessageType.SELECT_COUNTER:
+      return selectCounterActions(message);
+    case OcgMessageType.SELECT_SUM:
+      return selectSumActions(message);
     case OcgMessageType.SELECT_YESNO:
       return [
         { action_id: "yes", label: "Yes", tags: ["yes-no"], response: { type: OcgResponseType.SELECT_YESNO, yes: true } },
@@ -535,12 +1709,13 @@ function selectOptionActions(message) {
 
 function announceNumberActions(message) {
   return message.options.map((option, index) => {
-    const value = Number(option);
+    const display = typeof option === "bigint" ? Number(option) : Number(option);
     return {
       action_id: `announce-number-${index}`,
-      label: `Announce ${Number.isFinite(value) ? value : String(option)}`,
+      label: `Announce ${Number.isFinite(display) ? display : String(option)}`,
       tags: ["announce-number", "option"],
-      response: { type: OcgResponseType.ANNOUNCE_NUMBER, value },
+      // ocgcore expects the selected option index, not the announced value.
+      response: { type: OcgResponseType.ANNOUNCE_NUMBER, value: index },
     };
   });
 }
@@ -587,32 +1762,276 @@ function announceAttributeActions(message) {
   }];
 }
 
-function announceCardActions(message) {
-  const opcodes = message.opcodes ?? [];
-  const matches = [];
+function normalizeAnnounceOpcodes(opcodes) {
+  return (opcodes ?? []).map((opcode) => {
+    if (typeof opcode === "bigint") {
+      return opcode;
+    }
+    const numeric = Number(opcode);
+    return Number.isFinite(numeric) ? BigInt(numeric) : 0n;
+  });
+}
+
+function appendAnnounceCandidate(codes, seen, code) {
+  const normalized = Number(code);
+  if (!normalized || seen.has(normalized)) {
+    return;
+  }
+  seen.add(normalized);
+  codes.push(normalized);
+}
+
+function collectZoneCodes(team, location, codes, seen) {
+  if (!lib || !handle) {
+    return;
+  }
+  const count = lib.duelQueryCount(handle, team, location);
+  for (let sequence = 0; sequence < count; sequence += 1) {
+    try {
+      const info = lib.duelQuery(handle, {
+        flags: OcgQueryFlags.CODE,
+        controller: team,
+        location,
+        sequence,
+      });
+      if (info?.code) {
+        appendAnnounceCandidate(codes, seen, info.code);
+      }
+    } catch (_error) {
+      // ignore missing slots
+    }
+  }
+}
+
+function collectAnnounceCandidateCodes(player) {
+  const codes = [];
+  const seen = new Set();
+  if (!lib || !handle) {
+    for (const code of duelDeckCards) {
+      appendAnnounceCandidate(codes, seen, code);
+    }
+    return codes;
+  }
+  collectZoneCodes(player, OcgLocation.HAND, codes, seen);
+  const locations = [
+    OcgLocation.GRAVE,
+    OcgLocation.MZONE,
+    OcgLocation.SZONE,
+    OcgLocation.DECK,
+    OcgLocation.EXTRA,
+    OcgLocation.REMOVED,
+  ];
+  for (let team = 0; team < 2; team += 1) {
+    for (const location of locations) {
+      collectZoneCodes(team, location, codes, seen);
+    }
+  }
   for (const code of duelDeckCards) {
+    appendAnnounceCandidate(codes, seen, code);
+  }
+  return codes;
+}
+
+function cardMatchesAnnounceOpcodes(card, opcodes) {
+  const normalized = normalizeAnnounceOpcodes(opcodes);
+  if (!normalized.length) {
+    return true;
+  }
+  try {
+    return Boolean(cardMatchesOpcode(card, normalized));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function pickLooseAnnounceCard(player, opcodes) {
+  const normalized = normalizeAnnounceOpcodes(opcodes);
+  for (const code of collectAnnounceCandidateCodes(player)) {
     const card = database?.readCard(code);
     if (!card) {
       continue;
     }
-    if (opcodes.every((opcode) => cardMatchesOpcode(card, [opcode]))) {
-      matches.push(code);
+    if (normalized.length && !cardMatchesOpcode(card, normalized)) {
+      continue;
+    }
+    return code;
+  }
+  for (const code of collectAnnounceCandidateCodes(player)) {
+    if (database?.readCard(code)) {
+      return code;
     }
   }
-  if (matches.length === 0) {
-    return [{
-      action_id: "announce-card-fallback",
-      label: "Announce card (fallback)",
-      tags: ["announce-card", "fallback"],
-      response: { type: OcgResponseType.ANNOUNCE_CARD, card: 0 },
-    }];
+  return null;
+}
+
+function announceCardActions(message) {
+  const opcodes = message.opcodes ?? [];
+  const matches = [];
+  const seen = new Set();
+  for (const code of collectAnnounceCandidateCodes(message.player)) {
+    if (seen.has(code)) {
+      continue;
+    }
+    const card = database?.readCard(code);
+    if (!card) {
+      continue;
+    }
+    if (!cardMatchesAnnounceOpcodes(card, opcodes)) {
+      continue;
+    }
+    seen.add(code);
+    matches.push(code);
   }
+  matches.sort((left, right) => cardName(left).localeCompare(cardName(right)));
+  if (matches.length === 0) {
+    const looseCode = pickLooseAnnounceCard(message.player, opcodes);
+    if (looseCode) {
+      emitLog({
+        event: "announce_card_loose_fallback",
+        player: message.player,
+        opcode_count: opcodes.length,
+        pick: cardName(looseCode),
+      });
+      return [{
+        action_id: "announce-card-loose-0",
+        label: `Announce ${cardName(looseCode)}`,
+        tags: ["announce-card", "fallback"],
+        response: { type: OcgResponseType.ANNOUNCE_CARD, card: looseCode },
+      }];
+    }
+    emitLog({
+      event: "announce_card_no_matches",
+      player: message.player,
+      opcode_count: opcodes.length,
+      candidates: collectAnnounceCandidateCodes(message.player).length,
+    });
+    return [];
+  }
+  emitLog({
+    event: "announce_card_candidates",
+    player: message.player,
+    opcode_count: opcodes.length,
+    match_count: matches.length,
+    sample: matches.slice(0, 5).map((code) => cardName(code)),
+  });
   return matches.map((code, index) => ({
     action_id: `announce-card-${index}`,
     label: `Announce ${cardName(code)}`,
     tags: ["announce-card", ...effectTagsForCard(code)],
     response: { type: OcgResponseType.ANNOUNCE_CARD, card: code },
   }));
+}
+
+function selectCardPickCounts(message) {
+  const selects = message.selects ?? [];
+  if (selects.length === 0) {
+    return [];
+  }
+  const min = Math.max(0, Number(message.min ?? 1));
+  const max = Math.min(Number(message.max ?? min), selects.length);
+  const counts = [];
+  for (let pickCount = min; pickCount <= max; pickCount += 1) {
+    counts.push(pickCount);
+  }
+  return counts.length ? counts : [Math.min(selects.length, Math.max(1, min))];
+}
+
+function selectCardPickCount(message) {
+  const counts = selectCardPickCounts(message);
+  if (!counts.length) {
+    return 0;
+  }
+  const min = Math.max(0, Number(message.min ?? 1));
+  const max = Math.min(Number(message.max ?? min), (message.selects ?? []).length);
+  return min === max ? counts[0] : max;
+}
+
+function selectCardCombinationCount(total, pickCount) {
+  if (pickCount <= 0 || pickCount > total) {
+    return 0;
+  }
+  let combos = 1;
+  for (let index = 0; index < pickCount; index += 1) {
+    combos = (combos * (total - index)) / (index + 1);
+  }
+  return Math.round(combos);
+}
+
+function selectCardCombinationLimit(total, pickCount) {
+  const totalCombos = selectCardCombinationCount(total, pickCount);
+  if (totalCombos <= 512) {
+    return totalCombos;
+  }
+  return 512;
+}
+
+function selectCardCombinations(total, pickCount, maxCombos = selectCardCombinationLimit(total, pickCount)) {
+  const combos = [];
+  const picked = [];
+  function walk(start) {
+    if (combos.length >= maxCombos) {
+      return;
+    }
+    if (picked.length === pickCount) {
+      combos.push([...picked]);
+      return;
+    }
+    for (let index = start; index < total; index += 1) {
+      picked.push(index);
+      walk(index + 1);
+      picked.pop();
+    }
+  }
+  walk(0);
+  return combos;
+}
+
+function scoreSelectCombo(selects, combo) {
+  let score = 0;
+  for (const index of combo) {
+    const code = Number(selects[index]?.code ?? 0);
+    for (const tag of effectTagsForCard(code)) {
+      score += 10;
+      if (["removal", "negate", "search", "special-summon"].includes(tag)) {
+        score += 5;
+      }
+    }
+    if (duelDeckCards.includes(code)) {
+      score += 3;
+    }
+  }
+  return score;
+}
+
+function chooseBestSelectCardAction(legalActions, message) {
+  const selects = message.selects ?? [];
+  const candidates = legalActions.filter(
+    (action) => action.action_id.startsWith("select-card")
+      || action.action_id === "cancel-select-card",
+  );
+  if (!candidates.length) {
+    return legalActions[0];
+  }
+  const context = { messageType: OcgMessageType.SELECT_CARD, selects };
+  return candidates
+    .sort((left, right) => selectCardActionSortKey(left, context) - selectCardActionSortKey(right, context))[0];
+}
+
+function pushSelectCardCodeActions(actions, selects, combo) {
+  const codes = combo.map((index) => Number(selects[index]?.code ?? 0)).filter((code) => code > 0);
+  if (!codes.length) {
+    return;
+  }
+  const label = combo.map((index) => cardName(Number(selects[index]?.code ?? 0))).join(", ");
+  actions.push({
+    action_id: `select-card-codes-${combo.join("-")}`,
+    label: `Select by code: ${label}`,
+    tags: ["select-card", ...new Set(codes.flatMap((code) => effectTagsForCard(code)))],
+    response: {
+      type: OcgResponseType.SELECT_CARD_CODES,
+      codes,
+    },
+  });
 }
 
 function selectCardActions(message) {
@@ -625,17 +2044,54 @@ function selectCardActions(message) {
       response: { type: OcgResponseType.SELECT_CARD, indicies: null },
     });
   }
-  const min = Number(message.min ?? 1);
-  const pickCount = Math.max(1, Math.min(min, message.selects.length));
-  message.selects.forEach((card, index) => actions.push({
-    action_id: `select-card-${index}`,
-    label: `Select ${cardName(card.code)}`,
-    tags: ["select-card", ...effectTagsForCard(card.code)],
-    response: {
-      type: OcgResponseType.SELECT_CARD,
-      indicies: buildSelectionIndices(index, pickCount, message.selects.length),
-    },
-  }));
+  const selects = message.selects ?? [];
+  for (const pickCount of selectCardPickCounts(message)) {
+    if (pickCount <= 0) {
+      continue;
+    }
+    if (pickCount > 1) {
+      const combos = selectCardCombinations(selects.length, pickCount)
+        .sort((left, right) => scoreSelectCombo(selects, right) - scoreSelectCombo(selects, left));
+      combos.forEach((combo) => {
+        const codes = combo.map((index) => Number(selects[index]?.code ?? 0));
+        const label = combo.map((index) => cardName(Number(selects[index]?.code ?? 0))).join(", ");
+        actions.push({
+          action_id: `select-card-combo-${combo.join("-")}`,
+          label: `Select ${label}`,
+          tags: ["select-card", ...new Set(codes.flatMap((code) => effectTagsForCard(code)))],
+          response: {
+            type: OcgResponseType.SELECT_CARD,
+            indicies: combo,
+          },
+        });
+        pushSelectCardCodeActions(actions, selects, combo);
+      });
+      continue;
+    }
+    selects.forEach((card, index) => {
+      const code = Number(card.code ?? 0);
+      actions.push({
+        action_id: `select-card-${index}`,
+        label: `Select ${cardName(code)}`,
+        tags: ["select-card", ...effectTagsForCard(code)],
+        response: {
+          type: OcgResponseType.SELECT_CARD,
+          indicies: [index],
+        },
+      });
+      if (code > 0) {
+        actions.push({
+          action_id: `select-card-code-${index}`,
+          label: `Select ${cardName(code)} (by code)`,
+          tags: ["select-card", ...effectTagsForCard(code)],
+          response: {
+            type: OcgResponseType.SELECT_CARD_CODES,
+            codes: [code],
+          },
+        });
+      }
+    });
+  }
   return actions;
 }
 
@@ -649,8 +2105,10 @@ function selectTributeActions(message) {
       response: { type: OcgResponseType.SELECT_TRIBUTE, indicies: null },
     });
   }
-  const min = Number(message.min ?? 1);
-  const pickCount = Math.max(1, Math.min(min, message.selects.length));
+  const pickCount = selectCardPickCount(message);
+  if (pickCount === 0) {
+    return actions;
+  }
   message.selects.forEach((card, index) => actions.push({
     action_id: `select-tribute-${index}`,
     label: `Tribute ${cardName(card.code)}`,
@@ -664,26 +2122,93 @@ function selectTributeActions(message) {
 }
 
 function buildSelectionIndices(preferredIndex, count, total) {
-  const picks = [preferredIndex];
-  for (let offset = 1; picks.length < count && offset < total; offset += 1) {
-    const candidate = (preferredIndex + offset) % total;
-    if (!picks.includes(candidate)) {
-      picks.push(candidate);
+  if (count <= 1) {
+    return [preferredIndex];
+  }
+  return selectCardCombinations(total, count, 1)[0] ?? [preferredIndex];
+}
+
+function sortCardActions(message) {
+  const cards = message.cards ?? [];
+  if (cards.length === 0) {
+    return [];
+  }
+  const identityOrder = cards.map((_card, index) => index);
+  const label = cards.length === 1
+    ? `Confirm order for ${cardName(cards[0].code)}`
+    : `Keep ${cards.length} cards in current order`;
+  return [{
+    action_id: "sort-cards-identity",
+    label,
+    tags: ["sort-card", "shuffle"],
+    response: { type: OcgResponseType.SORT_CARD, order: identityOrder },
+  }];
+}
+
+function selectCounterActions(message) {
+  const cards = message.cards ?? [];
+  const target = Math.max(0, Number(message.count ?? 0));
+  if (cards.length === 0) {
+    return [{
+      action_id: "select-counter-empty",
+      label: "Confirm counter selection",
+      tags: ["select-counter"],
+      response: { type: OcgResponseType.SELECT_COUNTER, counters: [] },
+    }];
+  }
+  const counters = new Array(cards.length).fill(0);
+  let remaining = target;
+  for (let index = 0; index < cards.length && remaining > 0; index += 1) {
+    const available = Math.max(0, Number(cards[index].count ?? 0));
+    const take = Math.min(available, remaining);
+    counters[index] = take;
+    remaining -= take;
+  }
+  return [{
+    action_id: "select-counter-default",
+    label: `Remove ${target} counter(s)`,
+    tags: ["select-counter"],
+    response: { type: OcgResponseType.SELECT_COUNTER, counters },
+  }];
+}
+
+function selectSumActions(message) {
+  const optional = message.selects ?? [];
+  const must = message.selects_must ?? [];
+  const targetAmount = Number(message.amount ?? 0);
+  const minPicks = Math.max(0, Number(message.min ?? 0));
+  const maxPicks = Math.max(minPicks, Number(message.max ?? optional.length));
+  const mustSum = must.reduce((total, card) => total + Number(card.amount ?? 0), 0);
+  let remaining = Math.max(0, targetAmount - mustSum);
+  const picked = [];
+  for (let index = 0; index < optional.length; index += 1) {
+    if (picked.length >= maxPicks) {
+      break;
+    }
+    if (remaining <= 0 && picked.length >= minPicks) {
+      break;
+    }
+    picked.push(index);
+    remaining -= Number(optional[index].amount ?? 0);
+  }
+  while (picked.length < minPicks && picked.length < optional.length) {
+    const next = picked.length;
+    if (!picked.includes(next)) {
+      picked.push(next);
+    } else {
+      break;
     }
   }
-  return picks;
+  return [{
+    action_id: "select-sum-default",
+    label: `Select materials totalling ${targetAmount}`,
+    tags: ["select-sum"],
+    response: { type: OcgResponseType.SELECT_SUM, indicies: picked },
+  }];
 }
 
 function idleActions(message, lifePoints) {
   const actions = [];
-  // Put safe phase actions first for baseline agents. More ambitious agents can
-  // still choose summons, sets, and activations from the full legal action list.
-  if (message.to_ep) {
-    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_EP, index: null } });
-  }
-  if (message.to_bp) {
-    actions.push({ action_id: "to-battle-phase", label: "Go to Battle Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_BP, index: null } });
-  }
   message.summons.forEach((card, index) => actions.push({
     action_id: `normal-summon-${index}`,
     label: `Normal Summon ${cardName(card.code)}`,
@@ -696,6 +2221,16 @@ function idleActions(message, lifePoints) {
     tags: ["special-summon"],
     response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPECIAL_SUMMON, index },
   }));
+  (message.pos_changes ?? []).forEach((card, index) => {
+    const tags = ["pos-change", ...effectTagsForCard(card.code)];
+    actions.push({
+      action_id: `pos-change-${index}`,
+      label: `Change position of ${cardName(card.code)}`,
+      expected_value: expectedValueForTags(tags),
+      tags,
+      response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_POS_CHANGE, index },
+    });
+  });
   message.activates.forEach((card, index) => {
     const tags = ["activate", ...effectTagsForCard(card.code)];
     actions.push({
@@ -726,6 +2261,20 @@ function idleActions(message, lifePoints) {
       response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SELECT_SPELL_SET, index },
     });
   });
+  if (message.shuffle) {
+    actions.push({
+      action_id: "shuffle-hand",
+      label: "Shuffle hand",
+      tags: ["shuffle"],
+      response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.SHUFFLE, index: null },
+    });
+  }
+  if (message.to_bp) {
+    actions.push({ action_id: "to-battle-phase", label: "Go to Battle Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_BP, index: null } });
+  }
+  if (message.to_ep) {
+    actions.push({ action_id: "to-end-phase", label: "Go to End Phase", tags: ["phase"], response: { type: OcgResponseType.SELECT_IDLECMD, action: SelectIdleCMDAction.TO_EP, index: null } });
+  }
   return actions;
 }
 
@@ -739,6 +2288,9 @@ function battleActions(message, lifePoints) {
     actions.push({ action_id: "to-main-phase-2", label: "Go to Main Phase 2", tags: ["phase"], response: { type: OcgResponseType.SELECT_BATTLECMD, action: SelectBattleCMDAction.TO_M2, index: null } });
   }
   message.attacks.forEach((card, index) => {
+    if (card.can_direct && opponentFieldHasMonsters(message.player)) {
+      return;
+    }
     const attack = Math.max(0, cardAttack(card.code));
     const opponent = message.player === 0 ? 1 : 0;
     const damage = card.can_direct ? attack : Math.floor(attack / 2);
@@ -1106,7 +2658,17 @@ function isVanillaMonster(type) {
 
 
 function summarizeMessage(message, lifePoints = [8000, 8000]) {
-  return `EDOPro ${ocgMessageTypeStrings.get(message.type) ?? message.type} decision | LP ${playerName(0)}:${lifePoints[0]} ${playerName(1)}:${lifePoints[1]}`;
+  const base = `EDOPro ${ocgMessageTypeStrings.get(message.type) ?? message.type} decision | LP ${playerName(0)}:${lifePoints[0]} ${playerName(1)}:${lifePoints[1]}`;
+  if (message.type === OcgMessageType.SELECT_CARD) {
+    const enriched = enrichSelectCardMessage(message);
+    const pickCount = selectCardPickCount(enriched);
+    const names = (enriched.selects ?? [])
+      .map((card) => cardName(Number(card.code ?? 0)))
+      .slice(0, 8)
+      .join(", ");
+    return `${base} | pick ${pickCount} from: ${names || "unknown cards"}`;
+  }
+  return base;
 }
 
 function cardName(code) {
@@ -1224,6 +2786,11 @@ function parseSeed(value) {
   return value.map((part) => BigInt(part));
 }
 
+function generateRandomSeed() {
+  const bytes = randomBytes(32);
+  return Array.from({ length: 4 }, (_, index) => bytes.readBigUInt64BE(index * 8));
+}
+
 function parseArgs(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -1232,6 +2799,8 @@ function parseArgs(argv) {
       parsed.edoproHome = argv[++index];
     } else if (arg === "--max-decisions") {
       parsed.maxDecisions = argv[++index];
+    } else if (arg === "--max-duel-turns") {
+      parsed.maxDuelTurns = argv[++index];
     } else if (arg === "--deck-a") {
       parsed.deckA = argv[++index];
     } else if (arg === "--deck-b") {
@@ -1382,7 +2951,15 @@ async function main() {
   const decksA = parsePlayerDecks(startMessage, "deck_a", DEFAULT_DECK_A);
   const decksB = parsePlayerDecks(startMessage, "deck_b", DEFAULT_DECK_B);
   duelDeckCards = [...new Set([...decksA.main, ...decksA.extra, ...decksB.main, ...decksB.extra])];
-  currentDuelSeed = parseSeed(startMessage.seed) ?? [1n, 2n, 3n, 4n];
+  currentDuelSeed = parseSeed(startMessage.seed) ?? generateRandomSeed();
+  if (startMessage.max_duel_turns !== undefined && startMessage.max_duel_turns !== null) {
+    maxDuelTurns = Number(startMessage.max_duel_turns);
+  }
+  if (startMessage.max_decisions !== undefined && startMessage.max_decisions !== null) {
+    maxDecisions = Number(startMessage.max_decisions);
+  }
+
+  ensureOcgcoreSelectPatch();
 
   const databasePath = resolveDatabasePath(edoproHome);
   emitLog({ event: "database_loaded", path: path.relative(edoproHome, databasePath) });
@@ -1401,14 +2978,20 @@ async function main() {
   lib = await createCore({
     sync: true,
     print: () => {},
-    printErr: (line) => emitLog(line),
+    printErr: (line) => {
+      try {
+        process.stderr.write(`${String(line).replace(/\r?\n$/, "")}\n`);
+      } catch {
+        // ignore stderr write failures
+      }
+    },
   });
 
   duelMode = resolveDuelMode(startMessage);
   emitLog({ event: "duel_mode", mode: String(duelMode) });
 
   handle = await lib.createDuel({
-    flags: duelMode,
+    flags: duelMode | OcgDuelMode.SIMPLE_AI,
     seed: currentDuelSeed,
     team1: { startingLP: 8000, startingDrawCount: 5, drawCountPerTurn: 1 },
     team2: { startingLP: 8000, startingDrawCount: 5, drawCountPerTurn: 1 },

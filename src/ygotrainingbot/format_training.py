@@ -28,8 +28,8 @@ class FormatTrainingConfig:
             raise ValueError("deck_b must contain at least 40 card IDs.")
         if self.games < 1:
             raise ValueError("games must be at least 1.")
-        if self.max_decisions < 1:
-            raise ValueError("max_decisions must be at least 1.")
+        if self.max_decisions < 0:
+            raise ValueError("max_decisions must be 0 (unlimited) or greater.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +84,7 @@ class FormatPack:
     description: str = ""
     games: int = 25
     max_decisions: int = 40
+    max_duel_turns: int = 0
 
     def validate(self) -> None:
         if not self.name:
@@ -94,8 +95,10 @@ class FormatPack:
             deck.validate()
         if self.games < 1:
             raise ValueError("games must be at least 1.")
-        if self.max_decisions < 1:
-            raise ValueError("max_decisions must be at least 1.")
+        if self.max_decisions < 0:
+            raise ValueError("max_decisions must be 0 (unlimited) or greater.")
+        if self.max_duel_turns < 0:
+            raise ValueError("max_duel_turns must be 0 or greater.")
 
 
 def load_format_training_config(path: Path) -> FormatTrainingConfig:
@@ -137,6 +140,7 @@ def load_format_pack(path: Path) -> FormatPack:
         description=str(payload.get("description", "")),
         games=int(payload.get("games", 25)),
         max_decisions=int(payload.get("max_decisions", 40)),
+        max_duel_turns=int(payload.get("max_duel_turns", 0)),
         banlist=FormatBanlist(
             forbidden=_card_ids_or_empty(banlist_payload.get("forbidden"), "banlist.forbidden"),
             limited=_card_ids_or_empty(banlist_payload.get("limited"), "banlist.limited"),
@@ -152,10 +156,12 @@ def load_format_pack(path: Path) -> FormatPack:
 
 
 def _card_ids(value: Any, field_name: str) -> tuple[int, ...]:
+    from ygotrainingbot.card_ids import canonicalize_card_ids
+
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list of card IDs.")
     try:
-        return tuple(int(card_id) for card_id in value)
+        return canonicalize_card_ids(int(card_id) for card_id in value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} contains a non-integer card ID.") from exc
 

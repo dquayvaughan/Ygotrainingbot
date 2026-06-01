@@ -1,0 +1,15 @@
+{
+  "name": "@ygotrainingbot/edopro-replay",
+  "version": "1.0.0",
+  "description": "EDOPro replay helpers (conversion runs via Python: convert-edopro-replay).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test 2>/dev/null || echo \"Run: python -m pytest tests/test_replay_convert.py\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "lzma": "^1.2.1",
+    "ocgcore-wasm": "^0.1.2"
+  }
+}

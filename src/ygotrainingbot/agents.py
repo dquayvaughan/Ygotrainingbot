@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -89,14 +90,15 @@ class ScoredHeuristicAgent:
         "position": 15,
         "chain": 15,
         "decline": -70,
-        "phase": -40,
+        "phase": -70,
     }
     LABEL_SCORES = {
-        "go to end phase": -80,
-        "go to battle phase": 120,
-        "go to main phase 2": -10,
+        "go to end phase": -140,
+        "go to battle phase": 140,
+        "go to main phase 2": -40,
         "do not chain": -30,
         "do not activate": -40,
+        "pot of prosperity": -800,
         "yes": 5,
         "no": -5,
     }
@@ -112,10 +114,28 @@ class ScoredHeuristicAgent:
     def choose_action(self, state: VisibleGameState) -> GameAction:
         if not state.legal_actions:
             raise ValueError(f"State {state.state_id!r} has no legal actions.")
-        return max(
+        select_actions = _select_card_actions(state.legal_actions)
+        if select_actions and _is_select_card_decision(state, select_actions):
+            return self._choose_select_card_action(state, select_actions)
+        ranked = max(
             enumerate(state.legal_actions),
             key=lambda indexed_action: (self._score(indexed_action[1]), -indexed_action[0]),
-        )[1]
+        )
+        chosen = ranked[1]
+        if chosen.action_id in {"to-end-phase", "to-main-phase-2"}:
+            proactive = [
+                action
+                for action in state.legal_actions
+                if not action.action_id.startswith("to-")
+                and not action.action_id.startswith("decline-")
+                and action.action_id not in {"finish-selection", "cancel-selection"}
+            ]
+            if proactive:
+                return max(
+                    enumerate(proactive),
+                    key=lambda indexed_action: (self._score(indexed_action[1]), -indexed_action[0]),
+                )[1]
+        return chosen
 
     def evaluate_actions(self, state: VisibleGameState) -> tuple[ActionEvaluation, ...]:
         """Return every legal action with the policy's score."""
@@ -180,6 +200,92 @@ class ScoredHeuristicAgent:
     @property
     def pressure_weight(self) -> float:
         return 0.01
+
+    def _choose_select_card_action(
+        self,
+        state: VisibleGameState,
+        select_actions: tuple[GameAction, ...],
+    ) -> GameAction:
+        prompt = state.select_card
+        pick_count = prompt.pick_count if prompt is not None else 1
+        combo_actions = tuple(
+            action for action in select_actions if action.action_id.startswith("select-card-combo-")
+        )
+        if pick_count > 1 and combo_actions:
+            return max(
+                enumerate(combo_actions),
+                key=lambda indexed: (self._score(indexed[1]), -indexed[0]),
+            )[1]
+        if pick_count > 1:
+            indexed_singles = [
+                (int(match.group(1)), action)
+                for action in select_actions
+                if (match := re.fullmatch(r"select-card-(\d+)", action.action_id))
+            ]
+            if indexed_singles:
+                return min(indexed_singles, key=lambda item: item[0])[1]
+        named = [
+            action
+            for action in select_actions
+            if re.fullmatch(r"select-card-(\d+)", action.action_id)
+        ]
+        if named:
+            archetype_hint = _select_card_archetype_hint(state.summary, named)
+            if archetype_hint is not None:
+                return archetype_hint
+        return max(
+            enumerate(select_actions),
+            key=lambda indexed: (self._score(indexed[1]), -indexed[0]),
+        )[1]
+
+
+def _select_card_archetype_hint(summary: str, actions: list[GameAction]) -> GameAction | None:
+    """Prefer clearly on-archetype cards for ambiguous 1-of-N hand prompts."""
+
+    summary_lower = summary.lower()
+    archetype_keys = (
+        ("vanquish soul", ("vanquish soul", "stake your soul")),
+        ("k9", ("k9-", "k9 ")),
+        ("ryzeal", ("ryzeal", "raziel")),
+        ("kashtira", ("kashtira",)),
+        ("primite", ("primite",)),
+    )
+    for archetype, needles in archetype_keys:
+        if archetype not in summary_lower and not any(
+            needle in action.label.lower() for action in actions for needle in needles
+        ):
+            continue
+        preferred = [
+            action
+            for action in actions
+            if any(needle in action.label.lower() for needle in needles)
+        ]
+        if preferred:
+            return preferred[0]
+    return None
+
+
+def _select_card_actions(legal_actions: tuple[GameAction, ...]) -> tuple[GameAction, ...]:
+    return tuple(
+        action
+        for action in legal_actions
+        if action.action_id.startswith("select-card-")
+    )
+
+
+def _is_select_card_decision(
+    state: VisibleGameState,
+    select_actions: tuple[GameAction, ...],
+) -> bool:
+    if state.select_card is not None:
+        return True
+    other = [
+        action
+        for action in state.legal_actions
+        if action.action_id not in {candidate.action_id for candidate in select_actions}
+        and action.action_id != "cancel-select-card"
+    ]
+    return not other
 
 
 class HeuristicActionAgent(ScoredHeuristicAgent):
@@ -250,6 +356,8 @@ class ShallowSearchAgent:
     def choose_action(self, state: VisibleGameState) -> GameAction:
         if not state.legal_actions:
             raise ValueError(f"State {state.state_id!r} has no legal actions.")
+        if len(state.legal_actions) > 24:
+            return self._base.choose_action(state)
 
         ranked = sorted(
             self._base.evaluate_actions(state),

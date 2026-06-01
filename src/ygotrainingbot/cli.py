@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Sequence
@@ -19,7 +21,7 @@ from ygotrainingbot.data import (
     load_card_database,
     save_card_database,
 )
-from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproInstall, JsonLineEdoproSimulator
+from ygotrainingbot.edopro import EdoproGatewayConfig, EdoproGatewayError, EdoproInstall, JsonLineEdoproSimulator
 from ygotrainingbot.format_training import FormatDeck, load_format_pack, load_format_training_config
 from ygotrainingbot.human_duels import (
     DEFAULT_CATALOG_DIR,
@@ -27,6 +29,12 @@ from ygotrainingbot.human_duels import (
     import_human_duels,
     write_learning_report,
 )
+from ygotrainingbot.replay_convert import (
+    ReplayParseError,
+    convert_replays_in_path,
+    write_converted_replay,
+)
+from ygotrainingbot.league_tournament import generate_duel_seed
 from ygotrainingbot.learning import learn_from_report
 from ygotrainingbot.script_health import count_script_runtime_errors, script_health_summary
 from ygotrainingbot.static_training import StaticSetTrainer, StaticTrainingReport
@@ -198,7 +206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     train_pack_parser.add_argument("--games-per-matchup", type=int, default=None)
     train_pack_parser.add_argument("--max-decisions", type=int, default=None)
-    train_pack_parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    train_pack_parser.add_argument("--timeout-seconds", type=float, default=1200.0)
     train_pack_parser.add_argument("--agent-a-policy", default="heuristic")
     train_pack_parser.add_argument("--agent-b-policy", default="heuristic")
     train_pack_parser.add_argument("--agent-a-weights", type=Path, default=None)
@@ -307,7 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--input-dir",
         type=Path,
         required=True,
-        help="Directory containing .json duel logs (full game logs or decisions-only).",
+        help="Directory with .json logs and/or .yrpX replays (replays are converted first).",
     )
     import_human_parser.add_argument(
         "--catalog-dir",
@@ -361,6 +369,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Optional path for the generated training report JSON.",
+    )
+
+    convert_replay_parser = subcommands.add_parser(
+        "convert-edopro-replay",
+        help="Convert an EDOPro .yrpX replay to human-duel JSON for the dashboard.",
+    )
+    convert_replay_parser.add_argument(
+        "replay",
+        type=Path,
+        help="Path to a .yrpX/.yrp file or an EDOPro replay/ directory (all saved replays).",
+    )
+    convert_replay_parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=None,
+        help="Output JSON path (default: <replay-stem>.human.json next to the replay).",
+    )
+    convert_replay_parser.add_argument(
+        "--study-agent",
+        default=None,
+        help="Player name to learn from (default: first player in the replay).",
+    )
+    convert_replay_parser.add_argument(
+        "--format",
+        dest="format_name",
+        default=None,
+        help="Format tag stored in meta.format (e.g. banlist-2026-01).",
+    )
+    convert_replay_parser.add_argument(
+        "--import",
+        dest="import_catalog",
+        action="store_true",
+        help="Import the converted JSON into the human-duels catalog.",
+    )
+    convert_replay_parser.add_argument(
+        "--catalog-dir",
+        type=Path,
+        default=DEFAULT_CATALOG_DIR,
+        help="Catalog root when using --import.",
+    )
+
+    bot_serve_parser = subcommands.add_parser(
+        "edopro-bot-serve",
+        help="HTTP server for EDOPro WindBot bridge (Local AI / server room bot).",
+    )
+    bot_serve_parser.add_argument("--host", default="127.0.0.1")
+    bot_serve_parser.add_argument("--port", type=int, default=8765)
+    bot_serve_parser.add_argument(
+        "--policy",
+        type=Path,
+        default=Path("data/learned-policy.json"),
+    )
+    bot_serve_parser.add_argument(
+        "--catalog-dir",
+        type=Path,
+        default=Path("data/human-duels"),
+    )
+    bot_serve_parser.add_argument("--bot-policy", default="heuristic")
+    bot_serve_parser.add_argument(
+        "--learn-after-duel",
+        action="store_true",
+        help="Import each finished duel and update --policy automatically.",
+    )
+    bot_serve_parser.add_argument(
+        "--study-agent",
+        default=None,
+        help="Player id to imitate when learning (default: bot player id).",
     )
 
     promote_parser = subcommands.add_parser(
@@ -794,6 +870,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary=args.summary,
             report=args.report,
         )
+    if args.command == "convert-edopro-replay":
+        return _convert_edopro_replay(
+            args.replay,
+            output=args.output,
+            study_agent=args.study_agent,
+            format_name=args.format_name,
+            import_catalog=args.import_catalog,
+            catalog_dir=args.catalog_dir,
+        )
+    if args.command == "edopro-bot-serve":
+        return _edopro_bot_serve(
+            host=args.host,
+            port=args.port,
+            policy=args.policy,
+            catalog_dir=args.catalog_dir,
+            bot_policy=args.bot_policy,
+            learn_after_duel=args.learn_after_duel,
+            study_agent=args.study_agent,
+        )
     if args.command == "promote-learned-policy":
         return _promote_learned_policy(
             args.pack,
@@ -1002,8 +1097,88 @@ def _learn_from_report(report: Path, *, policy: Path, summary: Path) -> int:
     return 0
 
 
+def _convert_edopro_replay(
+    replay_path: Path,
+    *,
+    output: Path | None,
+    study_agent: str | None,
+    format_name: str | None,
+    import_catalog: bool,
+    catalog_dir: Path,
+) -> int:
+    if replay_path.is_dir():
+        out_dir = output if output and output.is_dir() else replay_path
+        if output and not output.is_dir():
+            print("--output must be a directory when converting a replay folder.", file=sys.stderr)
+            return 1
+        written, errors = convert_replays_in_path(
+            replay_path,
+            output_dir=out_dir,
+            study_agent=study_agent,
+            format_name=format_name,
+        )
+        summary: dict[str, object] = {
+            "replay_dir": str(replay_path.resolve()),
+            "converted": len(written),
+            "outputs": [str(path) for path in written],
+            "errors": errors,
+        }
+        if import_catalog and written:
+            result = import_human_duels(
+                out_dir,
+                catalog_dir=catalog_dir,
+                glob_pattern="*.human.json",
+            )
+            summary["imported"] = len(result.imported)
+            summary["import_errors"] = [*errors, *result.errors]
+            if summary["import_errors"] and not summary.get("imported"):
+                print(json.dumps(summary, indent=2, sort_keys=True))
+                return 1
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        print(f"Converted {len(written)} replay(s) under {out_dir}")
+        if errors:
+            print(f"Warning: {len(errors)} file(s) skipped (see errors in JSON above).", file=sys.stderr)
+        return 0 if written else 1
+
+    out = output or replay_path.with_suffix(".human.json")
+    try:
+        written = write_converted_replay(
+            replay_path,
+            out,
+            study_agent=study_agent,
+            format_name=format_name,
+        )
+        payload = json.loads(written.read_text(encoding="utf-8"))
+    except ReplayParseError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    decision_count = len(payload.get("decisions") or ())
+    summary = {
+        "replay": str(replay_path.resolve()),
+        "output": str(written.resolve()),
+        "format": payload.get("meta", {}).get("format"),
+        "study_agent": payload.get("meta", {}).get("study_agent"),
+        "decisions": decision_count,
+        "winner": (payload.get("result") or {}).get("winner"),
+    }
+    if import_catalog:
+        staging = written.parent
+        result = import_human_duels(staging, catalog_dir=catalog_dir, glob_pattern=written.name)
+        summary["imported"] = len(result.imported)
+        summary["import_errors"] = result.errors
+        if result.errors:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+            return 1
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(f"Wrote {decision_count} decision(s) to {written}")
+    return 0
+
+
 def _import_human_duels(input_dir: Path, *, catalog_dir: Path, copy_files: bool) -> int:
+    _, convert_errors = convert_replays_in_path(input_dir, output_dir=input_dir)
     result = import_human_duels(input_dir, catalog_dir=catalog_dir, copy_files=copy_files)
+    result.errors = [*convert_errors, *result.errors]
     payload = {
         "catalog_dir": str(result.catalog_dir),
         "imported": len(result.imported),
@@ -1049,6 +1224,35 @@ def _learn_from_human_duels(
             encoding="utf-8",
         )
     return _learn_from_report(report_path, policy=policy, summary=summary)
+
+
+def _edopro_bot_serve(
+    *,
+    host: str,
+    port: int,
+    policy: Path,
+    catalog_dir: Path,
+    bot_policy: str,
+    learn_after_duel: bool,
+    study_agent: str | None,
+) -> int:
+    from ygotrainingbot.edopro_bot_server import run_edopro_bot_server
+
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_edopro_bot_server(
+            host,
+            port,
+            policy_path=policy,
+            catalog_dir=catalog_dir,
+            bot_policy=bot_policy,
+            learn_after_duel=learn_after_duel,
+            study_agent=study_agent,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return 0
 
 
 def _promote_learned_policy(
@@ -1999,8 +2203,10 @@ def _play_single_duel_report(
     game_log_path: Path | None = None,
     game_meta: dict[str, object] | None = None,
     game_number: int = 1,
+    live_log: object | None = None,
 ) -> dict[str, object]:
     from ygotrainingbot.deck_composition import effective_deck_for_bo3_game
+    from ygotrainingbot.duel_live_log import DuelLiveLog
     from ygotrainingbot.duel_logs import write_game_log
 
     if isinstance(deck_a, FormatDeck):
@@ -2011,7 +2217,7 @@ def _play_single_duel_report(
     config = EdoproGatewayConfig.from_shell_words(
         shlex.split(gateway_command, posix=os.name != "nt"),
         timeout_seconds=timeout_seconds,
-        startup_payload={"duel_mode": "mr3"},
+        startup_payload={"duel_mode": "mr3", "max_decisions": 0, "max_duel_turns": 0},
     )
     play_kwargs: dict[str, object] = {"seed": seed}
     main_a, parsed_extra_a, parsed_side_a = _deck_zone_parts(deck_a)
@@ -2035,7 +2241,8 @@ def _play_single_duel_report(
     if force_lp_pressure:
         agent_a = _LPPressureAgent(agent_a)
         agent_b = _LPPressureAgent(agent_b)
-    result = JsonLineEdoproSimulator(config).play(agent_a, agent_b, **play_kwargs)
+    duel_live = live_log if isinstance(live_log, DuelLiveLog) else None
+    result = JsonLineEdoproSimulator(config).play(agent_a, agent_b, live_log=duel_live, **play_kwargs)
     end_reason = str(result.metadata.get("end_reason", "unknown"))
     if require_lp_finish and end_reason == "deckout":
         # Preserve the duel trace but normalize terminal label for LP-only datasets.
@@ -2072,7 +2279,8 @@ def _play_single_duel_report(
             f"for {first_agent} vs {second_agent}."
         )
     wins_by_agent: dict[str, int] = {}
-    if result.winner is not None:
+    competitive_end_reasons = {"lp", "deckout", "turn_limit"}
+    if result.winner is not None and end_reason in competitive_end_reasons:
         wins_by_agent[result.winner] = 1
     tags: dict[str, int] = {}
     action_counts: dict[str, int] = {}
@@ -2082,6 +2290,8 @@ def _play_single_duel_report(
         decision_samples.append(
             {
                 "turn": trace.state.turn,
+                "duel_turn": trace.state.turn,
+                "decision_index": trace.state.decision_index,
                 "agent": trace.agent_name,
                 "summary": trace.state.summary,
                 "selected_action": trace.action.action_id,
@@ -2103,9 +2313,13 @@ def _play_single_duel_report(
     report = {
         "format": format_name,
         "games": 1,
-        "draws": 0
-        if end_reason in {"lp", "deckout"} and result.winner is not None
-        else 1,
+        "draws": 0 if result.winner is not None else 1,
+        "sim_faults": 1
+        if end_reason in {"retry_stuck", "max_decisions", "engine_stall"}
+        else 0,
+        "stale_turn_limit": 1
+        if end_reason == "turn_limit" and result.winner is None
+        else 0,
         "end_reason": end_reason,
         "agent_a_policy": agent_a_policy,
         "agent_b_policy": agent_b_policy,
@@ -2591,51 +2805,80 @@ def _collect_edopro_training_report(
     matchup_label: str | None = None,
     deck_a: object | None = None,
     deck_b: object | None = None,
+    rng: random.Random | None = None,
 ) -> dict[str, object]:
     if games < 1:
         raise ValueError("games must be at least 1.")
 
+    randomizer = rng or random.Random()
     wins_by_agent: dict[str, int] = {}
     tags: dict[str, int] = {}
     action_counts: dict[str, int] = {}
     game_log_paths: list[str] = []
     total_decisions = 0
     draws = 0
+    sim_faults = 0
+    stale_turn_limits = 0
+
+    failed_games: list[dict[str, object]] = []
+
+    from ygotrainingbot.duel_live_log import duel_live_log_from_env
+
+    live_log = duel_live_log_from_env()
+    matchup_label_display = matchup_label or f"{first_agent}_vs_{second_agent}"
 
     for game_index in range(1, games + 1):
         game_log_path = None
         if games_log_dir is not None:
             label = matchup_label or "matchup"
             game_log_path = games_log_dir / label / f"game-{game_index:02d}.json"
-        report = _play_single_duel_report(
-            gateway_command,
-            first_agent=first_agent,
-            second_agent=second_agent,
-            agent_a_policy=agent_a_policy,
-            agent_b_policy=agent_b_policy,
-            agent_a_weights=agent_a_weights,
-            agent_b_weights=agent_b_weights,
-            deck_a=deck_a,
-            deck_b=deck_b,
-            seed=(game_index, game_index + 1, game_index + 2, game_index + 3),
-            timeout_seconds=timeout_seconds,
-            format_name=format_name,
-            game_log_path=game_log_path,
-            game_number=game_index,
-            game_meta={
-                "format": format_name,
-                "game_number": game_index,
-                "first_agent": first_agent,
-                "second_agent": second_agent,
-                "matchup_label": matchup_label,
-            },
-        )
+        try:
+            seed = generate_duel_seed(randomizer)
+            if live_log is not None:
+                live_log.duel_start(
+                    game=game_index,
+                    games_total=games,
+                    first_agent=first_agent,
+                    second_agent=second_agent,
+                    policy_a=agent_a_policy,
+                    policy_b=agent_b_policy,
+                    seed=seed,
+                )
+            report = _play_single_duel_report(
+                gateway_command,
+                first_agent=first_agent,
+                second_agent=second_agent,
+                agent_a_policy=agent_a_policy,
+                agent_b_policy=agent_b_policy,
+                agent_a_weights=agent_a_weights,
+                agent_b_weights=agent_b_weights,
+                deck_a=deck_a,
+                deck_b=deck_b,
+                seed=seed,
+                timeout_seconds=timeout_seconds,
+                format_name=format_name,
+                game_log_path=game_log_path,
+                game_number=game_index,
+                game_meta={
+                    "format": format_name,
+                    "game_number": game_index,
+                    "first_agent": first_agent,
+                    "second_agent": second_agent,
+                    "matchup_label": matchup_label,
+                    "duel_seed": list(seed),
+                },
+            )
+        except EdoproGatewayError as exc:
+            failed_games.append({"game": game_index, "error": str(exc)})
+            continue
         total_decisions += int(report.get("traced_decisions", 0))
         if str(report.get("game_log_path")):
             game_log_paths.append(str(report["game_log_path"]))
+        sim_faults += int(report.get("sim_faults", 0))
+        stale_turn_limits += int(report.get("stale_turn_limit", 0))
         if int(report.get("draws", 0)) > 0:
             draws += 1
-        else:
+        elif not int(report.get("sim_faults", 0)):
             for winner, count in dict(report.get("wins_by_agent", {})).items():
                 wins_by_agent[str(winner)] = wins_by_agent.get(str(winner), 0) + int(count)
         for tag_name, count in dict(report.get("tags", {})).items():
@@ -2647,6 +2890,9 @@ def _collect_edopro_training_report(
         "format": format_name,
         "games": games,
         "draws": draws,
+        "sim_faults": sim_faults,
+        "stale_turn_limit": stale_turn_limits,
+        "failed_games": failed_games,
         "agent_a_policy": agent_a_policy,
         "agent_b_policy": agent_b_policy,
         "agent_a_weights": str(agent_a_weights) if agent_a_weights else None,
@@ -2747,6 +2993,7 @@ def _train_format_pack(
     pack = load_format_pack(pack_path)
     run_games = games_per_matchup if games_per_matchup is not None else pack.games
     run_max_decisions = max_decisions if max_decisions is not None else pack.max_decisions
+    run_max_duel_turns = pack.max_duel_turns  # 0 = play until LP/deckout (no turn clock)
     duel_mode = duel_mode_for_pack(pack)
     matchups: list[dict[str, object]] = []
     total_games = 0
@@ -2792,7 +3039,23 @@ def _train_format_pack(
             and not (deck_a_name and not deck_b_name and first_deck.name == second_deck.name)
         ]
 
-    for first_deck, second_deck in deck_pairs:
+    from ygotrainingbot.duel_live_log import duel_live_log_from_env
+
+    live_log = duel_live_log_from_env()
+
+    print(
+        f"[training] format-pack {pack.name}: {len(deck_pairs)} matchup(s), "
+        f"{run_games} game(s) each",
+        flush=True,
+    )
+    for matchup_index, (first_deck, second_deck) in enumerate(deck_pairs, start=1):
+        print(
+            f"[training] matchup {matchup_index}/{len(deck_pairs)}: "
+            f"{first_deck.name} vs {second_deck.name}",
+            flush=True,
+        )
+        if live_log is not None:
+            live_log.matchup_start(first_deck.name, second_deck.name, run_games)
         report = _collect_edopro_training_report(
             _gateway_command_for_decks(
                 gateway_script,
@@ -2801,6 +3064,7 @@ def _train_format_pack(
                 first_deck=first_deck,
                 second_deck=second_deck,
                 duel_mode=duel_mode,
+                max_duel_turns=run_max_duel_turns,
             ),
             games=run_games,
             first_agent="bot-a",
@@ -2816,6 +3080,12 @@ def _train_format_pack(
             deck_a=first_deck,
             deck_b=second_deck,
         )
+        if live_log is not None:
+            live_log.matchup_done(
+                wins=dict(report.get("wins_by_agent") or {}),
+                failed=len(report.get("failed_games") or []),
+                draws=int(report.get("draws", 0) or 0),
+            )
         total_games += int(report["games"])
         total_decisions += int(report["traced_decisions"])
         for tag, count in dict(report["tags"]).items():
@@ -3067,19 +3337,21 @@ def _gateway_command_base(
     edopro_home: Path,
     max_decisions: int,
     duel_mode: str = "mr3",
+    max_duel_turns: int = 0,
 ) -> str:
-    return _gateway_command_string(
-        [
-            "node",
-            str(gateway_script),
-            "--edopro-home",
-            str(edopro_home),
-            "--max-decisions",
-            str(max_decisions),
-            "--duel-mode",
-            duel_mode,
-        ]
-    )
+    parts = [
+        "node",
+        str(gateway_script),
+        "--edopro-home",
+        str(edopro_home),
+        "--max-decisions",
+        str(max_decisions),
+        "--duel-mode",
+        duel_mode,
+    ]
+    if max_duel_turns > 0:
+        parts.extend(["--max-duel-turns", str(max_duel_turns)])
+    return _gateway_command_string(parts)
 
 
 def _gateway_command_for_decks(
@@ -3090,23 +3362,25 @@ def _gateway_command_for_decks(
     first_deck: FormatDeck,
     second_deck: FormatDeck,
     duel_mode: str = "mr3",
+    max_duel_turns: int = 0,
 ) -> str:
-    return _gateway_command_string(
-        [
-            "node",
-            str(gateway_script),
-            "--edopro-home",
-            str(edopro_home),
-            "--max-decisions",
-            str(max_decisions),
-            "--duel-mode",
-            duel_mode,
-            "--deck-a",
-            _deck_arg(first_deck.main),
-            "--deck-b",
-            _deck_arg(second_deck.main),
-        ]
-    )
+    parts = [
+        "node",
+        str(gateway_script),
+        "--edopro-home",
+        str(edopro_home),
+        "--max-decisions",
+        str(max_decisions),
+        "--duel-mode",
+        duel_mode,
+        "--deck-a",
+        _deck_arg(first_deck.main),
+        "--deck-b",
+        _deck_arg(second_deck.main),
+    ]
+    if max_duel_turns > 0:
+        parts.extend(["--max-duel-turns", str(max_duel_turns)])
+    return _gateway_command_string(parts)
 
 
 def _gateway_command_string(parts: list[str]) -> str:

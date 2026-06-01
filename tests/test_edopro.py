@@ -91,6 +91,56 @@ def test_cli_edopro_play_once_uses_gateway(tmp_path: Path, capsys) -> None:
     assert payload["traced_decisions"] == 1
 
 
+def test_collect_edopro_training_report_draws_random_opening_hands(monkeypatch) -> None:
+    from ygotrainingbot.cli import _collect_edopro_training_report
+
+    captured_seeds: list[tuple[int, int, int, int]] = []
+
+    def fake_play(*_args, **kwargs):
+        captured_seeds.append(kwargs["seed"])
+        return {
+            "traced_decisions": 0,
+            "draws": 0,
+            "wins_by_agent": {"bot-a": 1},
+            "tags": {},
+            "action_counts": {},
+        }
+
+    monkeypatch.setattr("ygotrainingbot.cli._play_single_duel_report", fake_play)
+
+    report = _collect_edopro_training_report(
+        "fake-gateway",
+        games=3,
+        first_agent="bot-a",
+        second_agent="bot-b",
+        timeout_seconds=30.0,
+    )
+
+    assert report["games"] == 3
+    assert len(captured_seeds) == 3
+    assert len(set(captured_seeds)) == 3
+
+
+def test_select_card_from_payload() -> None:
+    from ygotrainingbot.edopro import _select_card_from_payload
+
+    prompt = _select_card_from_payload(
+        {
+            "min": 1,
+            "max": 1,
+            "pick_count": 1,
+            "can_cancel": False,
+            "cards": [
+                {"index": 0, "code": 123, "name": "Ash Blossom & Joyous Spring"},
+                {"index": 1, "code": 456, "name": 'Maxx "C"'},
+            ],
+        }
+    )
+    assert prompt is not None
+    assert prompt.pick_count == 1
+    assert prompt.cards[0] == (0, "Ash Blossom & Joyous Spring")
+
+
 def _write_fake_gateway(tmp_path: Path) -> Path:
     gateway = tmp_path / "fake_edopro_gateway.py"
     gateway.write_text(FAKE_GATEWAY, encoding="utf-8")

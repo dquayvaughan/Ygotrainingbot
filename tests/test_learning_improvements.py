@@ -2,7 +2,14 @@ import json
 from pathlib import Path
 
 from ygotrainingbot.duel_logs import samples_from_game_log_payload
-from ygotrainingbot.learning import LearnedPolicy, _outcome_weight_adjustments, _update_policy, learn_from_report
+from ygotrainingbot.learning import (
+    LearnedPolicy,
+    _outcome_weight_adjustments,
+    _update_policy,
+    _why_best_line_samples,
+    is_learnable_policy_tag,
+    learn_from_report,
+)
 from ygotrainingbot.policy_validation import validate_protagonist_policy_update
 from ygotrainingbot.progress import should_stop_on_regression
 
@@ -10,7 +17,7 @@ from ygotrainingbot.progress import should_stop_on_regression
 def test_samples_from_game_log_include_outcome_flags() -> None:
     payload = {
         "meta": {"goes_first": "bot-01", "home_bot_id": "bot-01", "away_bot_id": "bot-02"},
-        "result": {"winner": "bot-01", "loser": "bot-02"},
+        "result": {"winner": "bot-01", "loser": "bot-02", "turns": 9},
         "traces": [
             {
                 "agent": "bot-01",
@@ -33,6 +40,7 @@ def test_samples_from_game_log_include_outcome_flags() -> None:
     joey = next(sample for sample in samples if sample["agent"] == "bot-02")
     assert yugi["game_won"] is True
     assert yugi["bot_goes_first"] is True
+    assert yugi["game_turns"] == 9
     assert joey["game_won"] is False
 
 
@@ -48,6 +56,110 @@ def test_outcome_weight_adjustments_boost_winning_tags() -> None:
     adjustments = _outcome_weight_adjustments(samples)
     assert adjustments["attack"] > 0
     assert adjustments["phase"] < 0
+
+
+def test_outcome_weight_adjustments_ignore_state_descriptor_tags() -> None:
+    samples = [
+        {"game_won": True, "selected_tags": ["damage:3000", "opp-lp:700", "lethal"]},
+        {"game_won": True, "selected_tags": ["damage:0", "lp-swing:0", "lethal"]},
+        {"game_won": True, "selected_tags": ["damage:2800", "lethal", "removal"]},
+        {"game_won": True, "selected_tags": ["removal"]},
+        {"game_won": True, "selected_tags": ["removal"]},
+        {"game_won": True, "selected_tags": ["direct-attack"]},
+        {"game_won": True, "selected_tags": ["direct-attack"]},
+        {"game_won": True, "selected_tags": ["direct-attack"]},
+        {"game_won": False, "selected_tags": ["damage:3000", "phase"]},
+        {"game_won": False, "selected_tags": ["damage:0", "phase"]},
+        {"game_won": False, "selected_tags": ["damage:2800", "phase"]},
+    ]
+    adjustments = _outcome_weight_adjustments(samples)
+    assert "damage:3000" not in adjustments
+    assert "damage:0" not in adjustments
+    assert "opp-lp:700" not in adjustments
+    assert "lp-swing:0" not in adjustments
+    assert adjustments["lethal"] > 0
+    assert adjustments["removal"] > 0
+    assert adjustments["direct-attack"] > 0
+    assert adjustments["phase"] < 0
+
+
+def test_update_policy_drops_state_descriptor_weights() -> None:
+    previous = LearnedPolicy(
+        tag_weights={"damage:0": 2.0, "removal": 1.0, "opp-lp:300": -1.5},
+        observations=10,
+    )
+    analysis = {
+        "total_games": 1,
+        "draws": 0,
+        "total_decisions": 10,
+        "top_tags": [("removal", 5)],
+        "mistake_adjustments": {},
+        "outcome_adjustments": {},
+    }
+    learned = _update_policy(previous, analysis)
+    assert "damage:0" not in learned.tag_weights
+    assert "opp-lp:300" not in learned.tag_weights
+    assert learned.tag_weights["removal"] > 1.0
+
+
+def test_why_best_line_samples_include_card_labels_for_select_card() -> None:
+    evaluation = (
+        "selected_score=240.00; top_alternatives=["
+        "{'action_id': 'select-card-0', 'label': 'Select Ash Blossom & Joyous Spring', 'score': 240.0, 'tags': ['select-card', 'spell']}, "
+        "{'action_id': 'select-card-1', 'label': 'Select Maxx \"C\"', 'score': 30.0, 'tags': ['select-card', 'spell']}"
+        "]"
+    )
+    samples = [
+        {
+            "duel_turn": 3,
+            "decision_index": 13,
+            "summary": "EDOPro select_card decision",
+            "agent": "bot-a",
+            "selected_action": "select-card-0",
+            "selected_label": "Select Ash Blossom & Joyous Spring",
+            "selected_tags": ["select-card", "spell"],
+            "evaluation": evaluation,
+        }
+    ]
+    insights = _why_best_line_samples(samples)
+    assert len(insights) == 1
+    assert "select-card-0" in insights[0]
+    assert "Ash Blossom" in insights[0]
+    assert "select-card-1" in insights[0]
+    assert "Maxx" in insights[0]
+
+
+def test_why_best_line_samples_accepts_small_lethal_gaps() -> None:
+    evaluation = (
+        "selected_score=20828.80; top_alternatives=["
+        "{'action_id': 'attack-0', 'label': 'Direct attack', 'score': 20828.8, 'tags': ['attack', 'lethal', 'direct-attack']}, "
+        "{'action_id': 'attack-1', 'label': 'Direct attack alt', 'score': 20824.8, 'tags': ['attack', 'lethal', 'direct-attack']}"
+        "]"
+    )
+    samples = [
+        {
+            "turn": 4,
+            "duel_turn": 4,
+            "decision_index": 154,
+            "summary": "Battle phase",
+            "agent": "bot-a",
+            "selected_action": "attack-0",
+            "selected_tags": ["attack", "lethal", "direct-attack"],
+            "evaluation": evaluation,
+        }
+    ]
+    insights = _why_best_line_samples(samples)
+    assert len(insights) == 1
+    assert "duel turn 4" in insights[0]
+    assert "attack-0" in insights[0]
+    assert "attack-1" in insights[0]
+
+
+def test_is_learnable_policy_tag() -> None:
+    assert is_learnable_policy_tag("removal")
+    assert not is_learnable_policy_tag("damage:3000")
+    assert not is_learnable_policy_tag("opp-lp:700")
+    assert not is_learnable_policy_tag("monster")
 
 
 def test_update_policy_scales_league_learning() -> None:

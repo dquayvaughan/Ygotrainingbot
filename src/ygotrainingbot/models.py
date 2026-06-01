@@ -68,6 +68,17 @@ class GameAction:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectCardPrompt:
+    """Metadata for a mandatory SELECT_CARD prompt from the gateway."""
+
+    pick_count: int
+    min_picks: int
+    max_picks: int
+    can_cancel: bool
+    cards: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class VisibleGameState:
     """The information available to an agent when making a decision."""
 
@@ -77,6 +88,8 @@ class VisibleGameState:
     summary: str
     legal_actions: tuple[GameAction, ...]
     public_zones: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    decision_index: int = 0
+    select_card: SelectCardPrompt | None = None
 
 
 @dataclass(frozen=True, slots=True)

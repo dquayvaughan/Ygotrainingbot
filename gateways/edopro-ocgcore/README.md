@@ -21,9 +21,12 @@ Or point `--edopro-home` at a full ProjectIgnis install (`C:/ProjectIgnis`).
 
 ```bash
 cd gateways/edopro-ocgcore
-node smoke-duel.mjs C:/ProjectIgnis vanilla
-node smoke-duel.mjs C:/ProjectIgnis frog
+npm run smoke -- C:/ProjectIgnis vanilla
+npm run smoke -- C:/ProjectIgnis frog
+npm run smoke-pack -- ../../.ygotrain/edopro-home
 ```
+
+`smoke-pack-duel.mjs` runs a short duel with real format-pack decks (Kashtira vs Primite by default).
 
 A healthy run reports `"runtime_errors": 0` and `"prelude_loaded": ["constant.lua", "utility.lua"]` in `script_stats`.
 

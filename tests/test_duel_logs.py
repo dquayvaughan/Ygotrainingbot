@@ -39,6 +39,28 @@ def test_write_game_log_persists_full_traces(tmp_path: Path) -> None:
     assert payload["engine_logs"] == ["log"]
 
 
+def test_end_reason_stats_from_game_logs(tmp_path: Path) -> None:
+    from ygotrainingbot.duel_logs import end_reason_stats_from_report, write_game_log
+
+    for reason in ("retry_stuck", "lp"):
+        write_game_log(
+            tmp_path / f"{reason}.json",
+            meta={},
+            result=MatchResult(
+                winner="bot-a",
+                loser="bot-b",
+                turns=3,
+                traces=(),
+                tags=(),
+                metadata={"end_reason": reason},
+            ),
+        )
+    stats = end_reason_stats_from_report(
+        {"game_log_paths": [str(tmp_path / "retry_stuck.json"), str(tmp_path / "lp.json")]}
+    )
+    assert stats == {"retry_stuck": 1, "lp": 1}
+
+
 def test_load_decision_samples_from_game_log(tmp_path: Path) -> None:
     from ygotrainingbot.duel_logs import load_decision_samples_for_learning, write_game_log
 

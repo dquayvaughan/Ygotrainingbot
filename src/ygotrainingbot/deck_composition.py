@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Sequence
 
+from ygotrainingbot.card_ids import canonicalize_card_list
 from ygotrainingbot.format_training import FormatDeck
 
 MAIN_MIN = 40
@@ -98,14 +99,16 @@ def normalize_deck_dict(
 ) -> dict[str, object]:
     """Ensure main/extra/side zones are legal and separated."""
 
-    main = strip_extra_monsters_from_main([int(card_id) for card_id in payload.get("main", [])])
+    main = strip_extra_monsters_from_main(
+        canonicalize_card_list([int(card_id) for card_id in payload.get("main", [])])
+    )
     main_list = list(main)
     if pad_zones:
         pad_zone(main_list, main_staples_for_era(modern=modern), target=MAIN_MIN, maximum=MAIN_MAX)
     else:
         main_list = main_list[:MAIN_MAX]
 
-    extra = [int(card_id) for card_id in payload.get("extra", []) or []]
+    extra = canonicalize_card_list([int(card_id) for card_id in payload.get("extra", []) or []])
     if pad_zones:
         if not extra and payload.get("archetype") not in {"Goat Control", "Chaos Warrior"}:
             extra = list(extra_staples_for_era(modern=modern))
@@ -115,7 +118,7 @@ def normalize_deck_dict(
 
     side_raw = payload.get("side", []) or []
     if side_raw:
-        side = [int(card_id) for card_id in side_raw]
+        side = canonicalize_card_list([int(card_id) for card_id in side_raw])
         if pad_zones:
             pad_zone(side, side_staples_for_era(modern=modern), target=SIDE_MAX, maximum=SIDE_MAX)
         else:

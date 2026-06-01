@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ygotrainingbot.agents import DuelAgent
-from ygotrainingbot.models import DuelTrace, GameAction, MatchResult, VisibleGameState
+from ygotrainingbot.duel_live_log import DuelLiveLog
+from ygotrainingbot.models import DuelTrace, GameAction, MatchResult, SelectCardPrompt, VisibleGameState
 
 
 class EdoproError(RuntimeError):
@@ -32,6 +33,11 @@ class EdoproGatewayError(EdoproError):
 
 class EdoproGatewayTimeout(EdoproGatewayError):
     """Raised when the headless gateway does not produce a result in time."""
+
+
+# Cap each wait for the next gateway line so a blocking ocgcore CONTINUE cannot
+# hold the whole training job until the duel-level timeout expires.
+PER_READLINE_TIMEOUT_SECONDS = 90.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +170,12 @@ class JsonLineEdoproSimulator:
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
         traces: list[DuelTrace] = []
         gateway_logs: list[object] = []
         line_queue = _start_stdout_reader(process)
+        _start_stderr_reader(process, gateway_logs)
 
         try:
             start_payload: dict[str, Any] = {
@@ -189,16 +197,28 @@ class JsonLineEdoproSimulator:
                 start_payload["side_b"] = list(side_b)
             if seed is not None:
                 start_payload["seed"] = [str(part) for part in seed]
+            startup = self._config.startup_payload or {}
+            if startup.get("max_decisions") is not None:
+                start_payload["max_decisions"] = int(startup["max_decisions"])
+            if startup.get("max_duel_turns") is not None:
+                start_payload["max_duel_turns"] = int(startup["max_duel_turns"])
             self._send(process, start_payload)
             agents = {first_player.name: first_player, second_player.name: second_player}
+            progress_deadline = time.monotonic() + PER_READLINE_TIMEOUT_SECONDS
 
             while True:
                 self._ensure_time_remaining(started_at)
-                line = self._readline(process, line_queue, started_at)
-                message = _decode_message(line)
+                message = self._read_progress_message(
+                    process,
+                    line_queue,
+                    started_at,
+                    gateway_logs,
+                    progress_deadline,
+                )
                 message_type = message.get("type")
 
                 if message_type == "state":
+                    progress_deadline = time.monotonic() + PER_READLINE_TIMEOUT_SECONDS
                     state = _state_from_payload(message.get("state"))
                     try:
                         agent = agents[state.active_player]
@@ -212,9 +232,6 @@ class JsonLineEdoproSimulator:
                             f"Agent {agent.name!r} chose illegal action {action.action_id!r}."
                         )
                     explanation = ""
-                    explain = getattr(agent, "explain_decision", None)
-                    if callable(explain):
-                        explanation = str(explain(state, action))
                     traces.append(
                         DuelTrace(
                             state=state,
@@ -223,6 +240,14 @@ class JsonLineEdoproSimulator:
                             note=explanation,
                         )
                     )
+                    if live_log is not None:
+                        live_log.duel_decision(
+                            decision_index=state.decision_index,
+                            agent=agent.name,
+                            action_id=action.action_id,
+                            label=action.label,
+                            summary=state.summary,
+                        )
                     self._send(
                         process,
                         {
@@ -237,10 +262,6 @@ class JsonLineEdoproSimulator:
                 if message_type == "result":
                     return _result_from_payload(message, traces, gateway_logs)
 
-                if message_type == "log":
-                    gateway_logs.append(message.get("message", ""))
-                    continue
-
                 raise EdoproGatewayError(f"Unknown gateway message type: {message_type!r}")
         finally:
             _terminate_process(process)
@@ -248,37 +269,81 @@ class JsonLineEdoproSimulator:
     def _ensure_time_remaining(self, started_at: float) -> None:
         if time.monotonic() - started_at > self._config.timeout_seconds:
             raise EdoproGatewayTimeout(
-                f"EDOPro gateway exceeded {self._config.timeout_seconds:.1f}s timeout."
+                f"EDOPro gateway exceeded {self._config.timeout_seconds:.1f}s timeout "
+                f"waiting for the next JSON line."
             )
 
-    def _readline(
+    def _read_progress_message(
         self,
         process: subprocess.Popen[str],
         line_queue: "queue.Queue[str | None]",
         started_at: float,
-    ) -> str:
-        remaining = self._config.timeout_seconds - (time.monotonic() - started_at)
-        if remaining <= 0:
-            self._ensure_time_remaining(started_at)
-        try:
-            line = line_queue.get(timeout=remaining)
-        except queue.Empty as exc:
-            self._ensure_time_remaining(started_at)
-            raise EdoproGatewayTimeout("EDOPro gateway did not emit data before timeout.") from exc
+        gateway_logs: list[object],
+        progress_deadline: float,
+    ) -> dict[str, Any]:
+        while True:
+            if time.monotonic() >= progress_deadline:
+                raise EdoproGatewayTimeout(
+                    f"EDOPro gateway produced no state/result for "
+                    f"{PER_READLINE_TIMEOUT_SECONDS:.0f}s (likely ocgcore engine stall)."
+                )
+            duel_remaining = self._config.timeout_seconds - (time.monotonic() - started_at)
+            if duel_remaining <= 0:
+                self._ensure_time_remaining(started_at)
+            wait_seconds = min(
+                5.0,
+                duel_remaining,
+                max(0.05, progress_deadline - time.monotonic()),
+            )
+            try:
+                line = line_queue.get(timeout=wait_seconds)
+            except queue.Empty:
+                continue
 
-        if line:
-            return line
+            if not line:
+                stderr = process.stderr.read() if process.stderr else ""
+                if not stderr.strip():
+                    stderr_lines = [
+                        entry.get("line", entry)
+                        for entry in gateway_logs
+                        if isinstance(entry, dict) and entry.get("type") == "stderr"
+                    ]
+                    stderr = "\n".join(str(item) for item in stderr_lines[-20:])
+                detail = stderr.strip() or "(no stderr)"
+                raise EdoproGatewayError(
+                    f"EDOPro gateway exited before producing a result. stderr: {detail}"
+                )
 
-        stderr = process.stderr.read() if process.stderr else ""
-        raise EdoproGatewayError(
-            f"EDOPro gateway exited before producing a result. stderr: {stderr.strip()}"
-        )
+            message = _decode_message(line)
+            message_type = message.get("type")
+            if message_type == "log":
+                gateway_logs.append(message.get("message", ""))
+                continue
+            if message_type in {"state", "result"}:
+                return message
+            raise EdoproGatewayError(f"Unknown gateway message type: {message_type!r}")
 
     def _send(self, process: subprocess.Popen[str], message: dict[str, Any]) -> None:
         if process.stdin is None:
             raise EdoproGatewayError("Gateway stdin pipe was not available.")
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
+
+
+def _start_stderr_reader(process: subprocess.Popen[str], gateway_logs: list[object]) -> None:
+    if process.stderr is None:
+        return
+
+    def read_lines() -> None:
+        try:
+            for line in process.stderr:
+                text = line.rstrip()
+                if text:
+                    gateway_logs.append({"type": "stderr", "line": text})
+        except Exception:
+            return
+
+    threading.Thread(target=read_lines, daemon=True).start()
 
 
 def _start_stdout_reader(process: subprocess.Popen[str]) -> "queue.Queue[str | None]":
@@ -312,13 +377,39 @@ def _state_from_payload(payload: Any) -> VisibleGameState:
         raise EdoproGatewayError("State message missing object payload.")
 
     legal_actions = tuple(_action_from_payload(action) for action in payload.get("legal_actions", ()))
+    if payload.get("decision_index") is not None:
+        decision_index = int(payload["decision_index"])
+        duel_turn = int(payload.get("duel_turn", payload.get("turn", 1)))
+    else:
+        decision_index = int(payload.get("turn", 0))
+        duel_turn = 1
     return VisibleGameState(
         state_id=str(payload["state_id"]),
-        turn=int(payload.get("turn", 0)),
+        turn=duel_turn,
         active_player=str(payload["active_player"]),
         summary=str(payload.get("summary", "")),
         legal_actions=legal_actions,
         public_zones=_string_sequence_mapping(payload.get("public_zones", {})),
+        decision_index=decision_index,
+        select_card=_select_card_from_payload(payload.get("select_card")),
+    )
+
+
+def _select_card_from_payload(payload: Any) -> SelectCardPrompt | None:
+    if not isinstance(payload, dict):
+        return None
+    cards: list[tuple[int, str]] = []
+    for entry in payload.get("cards", ()):
+        if not isinstance(entry, dict):
+            continue
+        cards.append((int(entry.get("index", len(cards))), str(entry.get("name", ""))))
+    pick_count = int(payload.get("pick_count", payload.get("min", 1)))
+    return SelectCardPrompt(
+        pick_count=pick_count,
+        min_picks=int(payload.get("min", pick_count)),
+        max_picks=int(payload.get("max", pick_count)),
+        can_cancel=bool(payload.get("can_cancel")),
+        cards=tuple(cards),
     )
 
 

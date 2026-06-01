@@ -488,11 +488,28 @@ def _load_reference_pack(repo_root: Path, pack_stem: str) -> dict[str, dict[str,
     return _REFERENCE_CACHE[pack_stem]
 
 
-def _synthesize_shell(archetype: str, template: dict[str, Any]) -> dict[str, Any]:
+def _signature_rows(
+    archetype: str,
+    template: dict[str, Any],
+    *,
+    repo_root: Path,
+) -> tuple[tuple[int, int], ...]:
+    rows = template.get("signatures", ())
+    if any(int(copies) > 0 for _, copies in rows):
+        return tuple((int(card_id), int(copies)) for card_id, copies in rows)
+    from ygotrainingbot.ygoprodeck_decks import signature_card_ids
+
+    key_ids = signature_card_ids(archetype, repo_root=repo_root)
+    if not key_ids:
+        return rows
+    return tuple((int(card_id), 3) for card_id in key_ids[:3])
+
+
+def _synthesize_shell(archetype: str, template: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     modern = bool(template.get("modern"))
     main: list[int] = []
     extra_from_sigs: list[int] = []
-    for card_id, copies in template.get("signatures", ()):
+    for card_id, copies in _signature_rows(archetype, template, repo_root=repo_root):
         if copies <= 0:
             continue
         card_id = int(card_id)
@@ -545,19 +562,22 @@ def build_deck_shell(
     if archetype in cache:
         cached = dict(cache[archetype])
         cached["archetype"] = archetype
-        return normalize_deck_dict(
-            cached,
-            modern=modern,
-            require_side=False,
-            pad_zones=False,
-        )
+        from ygotrainingbot.ygoprodeck_decks import trusted_cache_entry
+
+        if trusted_cache_entry(archetype, cached, cache=cache, repo_root=repo_root):
+            return normalize_deck_dict(
+                cached,
+                modern=modern,
+                require_side=False,
+                pad_zones=False,
+            )
 
     if "reference" in template:
         pack = _load_reference_pack(repo_root, str(template["reference"]))
         ref_name = str(template.get("archetype", archetype))
         if ref_name in pack:
             return normalize_deck_dict(dict(pack[ref_name]), modern=False)
-    return _synthesize_shell(archetype, template)
+    return _synthesize_shell(archetype, template, repo_root=repo_root)
 
 
 def build_period_decks(

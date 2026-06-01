@@ -1,5 +1,5 @@
 from ygotrainingbot.agents import AggressiveHeuristicAgent, HeuristicActionAgent, RandomLegalActionAgent, create_agent
-from ygotrainingbot.models import GameAction, VisibleGameState
+from ygotrainingbot.models import GameAction, SelectCardPrompt, VisibleGameState
 
 
 def test_heuristic_agent_prefers_proactive_action_over_phase_end() -> None:
@@ -87,10 +87,75 @@ def test_control_agent_prefers_removal_chain_over_decline() -> None:
     assert create_agent("control").choose_action(state) == removal
 
 
+def test_heuristic_agent_picks_highest_scored_select_card() -> None:
+    pot = GameAction(
+        "select-card-0",
+        "Select Pot of Prosperity",
+        tags=("select-card", "spell", "banish", "removal"),
+    )
+    cyclone = GameAction(
+        "select-card-1",
+        "Select Cosmic Cyclone",
+        tags=("select-card", "spell", "banish", "removal"),
+    )
+    state = VisibleGameState(
+        state_id="select-card",
+        turn=3,
+        active_player="bot-a",
+        summary="EDOPro select_card decision | pick 1 from: Pot of Prosperity, Cosmic Cyclone",
+        legal_actions=(pot, cyclone),
+        select_card=SelectCardPrompt(
+            pick_count=1,
+            min_picks=1,
+            max_picks=1,
+            can_cancel=False,
+            cards=((0, "Pot of Prosperity"), (1, "Cosmic Cyclone")),
+        ),
+    )
+
+    assert HeuristicActionAgent().choose_action(state) == pot
+
+
+def test_heuristic_agent_uses_combo_actions_for_multi_pick() -> None:
+    combo = GameAction(
+        "select-card-combo-0-1",
+        "Select Card A, Card B",
+        tags=("select-card",),
+    )
+    single = GameAction(
+        "select-card-1",
+        "Select Card B",
+        tags=("select-card",),
+    )
+    state = VisibleGameState(
+        state_id="select-multi",
+        turn=2,
+        active_player="bot-a",
+        summary="pick 2",
+        legal_actions=(combo, single),
+        select_card=SelectCardPrompt(
+            pick_count=2,
+            min_picks=2,
+            max_picks=2,
+            can_cancel=False,
+            cards=((0, "Card A"), (1, "Card B")),
+        ),
+    )
+
+    assert HeuristicActionAgent().choose_action(state) == combo
+
+
 def test_learned_weights_affect_heuristic_scoring() -> None:
     phase = GameAction("to-end-phase", "Go to End Phase", tags=("phase",))
     summon = GameAction("normal-summon-0", "Normal Summon", tags=("normal-summon",))
-    state = VisibleGameState(
+    only_phase = VisibleGameState(
+        state_id="learned-phase",
+        turn=1,
+        active_player="bot-a",
+        summary="Learned weights on phase",
+        legal_actions=(phase,),
+    )
+    mixed = VisibleGameState(
         state_id="learned",
         turn=1,
         active_player="bot-a",
@@ -100,4 +165,5 @@ def test_learned_weights_affect_heuristic_scoring() -> None:
 
     agent = create_agent("heuristic", learned_weights={"phase": 300.0})
 
-    assert agent.choose_action(state) == phase
+    assert agent.choose_action(only_phase) == phase
+    assert agent.choose_action(mixed) == summon
